@@ -477,6 +477,76 @@ body {
   pointer-events: none;
 }
 
+/* Unmute Overlay Button */
+.btn-unmute-overlay {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(254, 44, 85, 0.95);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  padding: 12px 24px;
+  border-radius: 30px;
+  font-size: 0.9rem;
+  font-weight: 700;
+  box-shadow: 0 4px 24px rgba(254, 44, 85, 0.5);
+  cursor: pointer;
+  z-index: 26;
+  animation: pulse-ring 1.8s infinite;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  backdrop-filter: blur(8px);
+}
+
+.btn-unmute-overlay.hidden {
+  display: none !important;
+}
+
+/* Offline Card UI */
+.offline-card {
+  position: absolute;
+  inset: 0;
+  background: rgba(11, 12, 16, 0.94);
+  backdrop-filter: blur(10px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+  z-index: 24;
+}
+
+.offline-card.hidden {
+  display: none !important;
+}
+
+.offline-icon {
+  font-size: 2.8rem;
+  opacity: 0.6;
+}
+
+.offline-card h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: #fff;
+}
+
+.offline-card p {
+  font-size: 0.85rem;
+  color: var(--text-main);
+  max-width: 320px;
+}
+
+.offline-sub {
+  font-size: 0.75rem !important;
+  color: var(--text-muted) !important;
+  line-height: 1.4;
+}
+
 /* Player Overlay */
 .player-overlay {
   position: absolute;
@@ -492,7 +562,7 @@ body {
 }
 
 .player-overlay.hidden {
-  display: none;
+  display: none !important;
 }
 
 .overlay-content {
