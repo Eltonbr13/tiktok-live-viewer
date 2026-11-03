@@ -57,6 +57,12 @@ const btnFloatSound = document.getElementById('btn-float-sound');
 const btnFloatRatio = document.getElementById('btn-float-ratio');
 const btnFloatLikes = document.getElementById('btn-float-likes');
 
+const btnUnmuteOverlay = document.getElementById('btn-unmute-overlay');
+const offlineCard = document.getElementById('offline-card');
+const offlineTitle = document.getElementById('offline-title');
+const offlineMessage = document.getElementById('offline-message');
+const btnCheckLive = document.getElementById('btn-check-live');
+
 const floatingAvatar = document.getElementById('floating-avatar');
 const floatingName = document.getElementById('floating-name');
 const floatingTitle = document.getElementById('floating-title');
@@ -128,8 +134,52 @@ document.addEventListener('DOMContentLoaded', () => {
   btnToggleRatio.addEventListener('click', toggleAspectRatio);
   if (btnTheater) btnTheater.addEventListener('click', toggleTheaterMode);
   qualitySelect.addEventListener('change', onQualityChange);
-  engineSelect.addEventListener('change', onEngineChange);
+  engineSelect.addEventListener('change', () => {
+    engineSelect.dataset.userChanged = 'true';
+    onEngineChange();
+  });
   if (btnExternalPlayer) btnExternalPlayer.addEventListener('click', openInVlc);
+
+  if (btnUnmuteOverlay) {
+    btnUnmuteOverlay.addEventListener('click', (e) => {
+      e.stopPropagation();
+      videoElement.muted = false;
+      updateSoundButton();
+      hideUnmuteOverlay();
+      showToast('Áudio ativado 🔊');
+    });
+  }
+
+  if (btnCheckLive) {
+    btnCheckLive.addEventListener('click', () => {
+      if (currentStreamData?.username) {
+        showToast('Verificando status de @' + currentStreamData.username + '...');
+        loadStreamer(currentStreamData.username);
+      }
+    });
+  }
+
+  // Monitor video playback events to reliably clear loading overlay
+  videoElement.addEventListener('playing', () => {
+    clearTimeout(playAttemptTimeout);
+    showOverlay(false);
+    checkMutedState();
+  });
+
+  videoElement.addEventListener('loadeddata', () => {
+    clearTimeout(playAttemptTimeout);
+    showOverlay(false);
+  });
+
+  videoElement.addEventListener('waiting', () => {
+    // If buffering persists for > 5s, warn user
+    clearTimeout(bufferWarningTimeout);
+    bufferWarningTimeout = setTimeout(() => {
+      if (!videoElement.paused && videoElement.readyState < 3) {
+        showToast('Conexão oscilando... tentando estabilizar');
+      }
+    }, 5000);
+  });
 
   btnCopyM3u8.addEventListener('click', () => copyStreamUrl('m3u8'));
   btnCopyFlv.addEventListener('click', () => copyStreamUrl('flv'));
@@ -151,10 +201,15 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 });
 
+let playAttemptTimeout = null;
+let bufferWarningTimeout = null;
+
 // ========================================================
 // Stream Loading & API Call
 // ========================================================
 async function loadStreamer(username) {
+  hideOfflineCard();
+  hideUnmuteOverlay();
   showOverlay(true, 'Consultando status da live de @' + username + '...');
   btnSubmit.disabled = true;
 
@@ -178,11 +233,12 @@ async function loadStreamer(username) {
     connectChat(currentStreamData.username);
 
     if (currentStreamData.isLive) {
+      hideOfflineCard();
       populateQualitySelector(currentStreamData.streams.qualities);
       initPlayer();
-      showOverlay(false);
     } else {
-      showOverlay(true, `O canal @${currentStreamData.username} está OFFLINE no momento. Você ainda pode acompanhar o chat ou aguardar a transmissão.`, true);
+      showOfflineCard(currentStreamData.username, currentStreamData.title);
+      showOverlay(false);
     }
   } catch (err) {
     console.error('Erro:', err);
@@ -230,89 +286,51 @@ function updateUI(data) {
 }
 
 // ========================================================
-// Video Player (HLS / MPEG-TS FLV)
+// Video Player (Direct CDN + Proxy Fallback / HLS + FLV)
 // ========================================================
 function initPlayer() {
   if (!currentStreamData || !currentStreamData.streams) return;
-
-  const engine = engineSelect.value;
-  const quality = qualitySelect.value;
+  if (!currentStreamData.isLive) return;
 
   destroyPlayer();
+  showOverlay(true, 'Conectando ao stream ao vivo...');
 
-  if (engine === 'flv') {
+  const quality = qualitySelect.value;
+  const isSafariOrIOS = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) || (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream);
+
+  // Auto-detect optimal protocol for the platform if user hasn't explicitly chosen
+  if (!engineSelect.dataset.userChanged) {
+    engineSelect.value = isSafariOrIOS ? 'hls' : 'flv';
+  }
+
+  let preferredEngine = engineSelect.value;
+
+  // Timeout guard: if nothing plays in 6s, attempt fallback protocol
+  clearTimeout(playAttemptTimeout);
+  playAttemptTimeout = setTimeout(() => {
+    if (videoElement.paused || videoElement.readyState < 2) {
+      console.warn('Playback timeout on', preferredEngine, 'attempting auto-recovery...');
+      showToast('Ajustando formato para acelerar reprodução...');
+      if (preferredEngine === 'flv' && (Hls.isSupported() || isSafariOrIOS)) {
+        engineSelect.value = 'hls';
+        initHlsPlayer(true);
+      } else if (preferredEngine === 'hls' && mpegts.isSupported()) {
+        engineSelect.value = 'flv';
+        initFlvPlayer(null, true);
+      } else {
+        showOverlay(true, 'O servidor do TikTok está instável. Tente clicar em Tentar Novamente ou mudar o protocolo.', true);
+      }
+    }
+  }, 6000);
+
+  if (preferredEngine === 'flv') {
     initFlvPlayer(quality);
   } else {
     initHlsPlayer();
   }
 }
 
-function initHlsPlayer() {
-  const masterHls = currentStreamData.streams.hlsMaster;
-  if (!masterHls) {
-    showToast('Nenhum link HLS disponível. Tentando FLV...');
-    engineSelect.value = 'flv';
-    initFlvPlayer();
-    return;
-  }
-
-  const apiBase = getApiBaseUrl();
-  const proxyM3u8Url = `${apiBase}/api/proxy/m3u8?url=${encodeURIComponent(masterHls)}`;
-
-  if (window.Hls && Hls.isSupported()) {
-    currentHls = new Hls({
-      enableWorker: true,
-      lowLatencyMode: true,
-      backBufferLength: 20,
-      maxBufferLength: 8,
-      liveSyncDurationCount: 3
-    });
-
-    currentHls.loadSource(proxyM3u8Url);
-    currentHls.attachMedia(videoElement);
-
-    currentHls.on(Hls.Events.MANIFEST_PARSED, () => {
-      videoElement.play().catch(() => {
-        videoElement.muted = true;
-        updateSoundButton();
-        videoElement.play().catch(e => console.log('Autoplay error:', e));
-      });
-      showOverlay(false);
-    });
-
-    currentHls.on(Hls.Events.ERROR, (event, data) => {
-      if (data.fatal) {
-        switch (data.type) {
-          case Hls.ErrorTypes.NETWORK_ERROR:
-            currentHls.startLoad();
-            break;
-          case Hls.ErrorTypes.MEDIA_ERROR:
-            currentHls.recoverMediaError();
-            break;
-          default:
-            destroyPlayer();
-            showOverlay(true, 'Erro na reprodução HLS. Tente mudar o protocolo para FLV.', true);
-            break;
-        }
-      }
-    });
-  } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
-    // Native iOS Safari
-    videoElement.src = proxyM3u8Url;
-    videoElement.play().catch(() => {
-      videoElement.muted = true;
-      updateSoundButton();
-      videoElement.play();
-    });
-    showOverlay(false);
-  } else {
-    showToast('HLS não suportado. Tentando FLV...');
-    engineSelect.value = 'flv';
-    initFlvPlayer();
-  }
-}
-
-function initFlvPlayer(selectedQuality = null) {
+function initFlvPlayer(selectedQuality = null, useProxy = false) {
   let targetFlvUrl = '';
 
   if (selectedQuality && currentStreamData.streams.flvMap[selectedQuality]) {
@@ -322,44 +340,162 @@ function initFlvPlayer(selectedQuality = null) {
   }
 
   if (!targetFlvUrl) {
-    showOverlay(true, 'Nenhum stream FLV disponível.', true);
+    if (currentStreamData.streams.hlsMaster) {
+      engineSelect.value = 'hls';
+      initHlsPlayer(true);
+      return;
+    }
+    showOverlay(true, 'Nenhum stream FLV disponível no momento.', true);
     return;
   }
 
   const apiBase = getApiBaseUrl();
   const proxyFlvUrl = `${apiBase}/api/proxy/stream?url=${encodeURIComponent(targetFlvUrl)}`;
+  // Try direct TikTok CDN first for maximum speed and zero server lag; fallback to proxy if needed
+  const playUrl = useProxy ? proxyFlvUrl : targetFlvUrl;
 
   if (window.mpegts && mpegts.isSupported()) {
-    currentFlvPlayer = mpegts.createPlayer({
-      type: 'flv',
-      isLive: true,
-      url: proxyFlvUrl,
-      hasAudio: true,
-      hasVideo: true
-    }, {
-      enableWorker: true,
-      lazyLoad: false,
-      enableStashBuffer: false,
-      stashInitialSize: 128,
-      liveBufferLatencyChasing: true
-    });
+    try {
+      currentFlvPlayer = mpegts.createPlayer({
+        type: 'flv',
+        isLive: true,
+        url: playUrl,
+        hasAudio: true,
+        hasVideo: true,
+        cors: true
+      }, {
+        enableWorker: true,
+        lazyLoad: false,
+        enableStashBuffer: false,
+        stashInitialSize: 64,
+        liveBufferLatencyChasing: true,
+        autoCleanupSourceBuffer: true
+      });
 
-    currentFlvPlayer.attachMediaElement(videoElement);
-    currentFlvPlayer.load();
+      currentFlvPlayer.attachMediaElement(videoElement);
+      currentFlvPlayer.load();
 
-    currentFlvPlayer.play().catch(() => {
+      // Mobile autoplay requirement: start muted
       videoElement.muted = true;
       updateSoundButton();
-      currentFlvPlayer.play().catch(e => console.log('Autoplay error:', e));
+
+      currentFlvPlayer.on(mpegts.Events.ERROR, (errType, errDetail) => {
+        console.warn('mpegts error:', errType, errDetail);
+        if (!useProxy) {
+          console.log('Retrying FLV via proxy...');
+          destroyPlayer();
+          initFlvPlayer(selectedQuality, true);
+        } else if (currentStreamData.streams.hlsMaster) {
+          console.log('Falling back to HLS...');
+          destroyPlayer();
+          engineSelect.value = 'hls';
+          initHlsPlayer(true);
+        }
+      });
+
+      currentFlvPlayer.play().then(() => {
+        showOverlay(false);
+        checkMutedState();
+      }).catch((e) => {
+        console.log('Autoplay muted play handled:', e);
+        showOverlay(false);
+        checkMutedState();
+      });
+    } catch (e) {
+      console.error('Erro ao instanciar mpegts:', e);
+      if (currentStreamData.streams.hlsMaster) {
+        initHlsPlayer(true);
+      }
+    }
+  } else {
+    // Platform does not support MSE FLV (e.g. iOS Safari) -> auto use HLS
+    engineSelect.value = 'hls';
+    initHlsPlayer(true);
+  }
+}
+
+function initHlsPlayer(useDirect = false) {
+  const masterHls = currentStreamData.streams.hlsMaster;
+  if (!masterHls) {
+    if (currentStreamData.streams.bestFlv && mpegts.isSupported()) {
+      engineSelect.value = 'flv';
+      initFlvPlayer(null, true);
+      return;
+    }
+    showOverlay(true, 'Nenhum link HLS disponível.', true);
+    return;
+  }
+
+  const apiBase = getApiBaseUrl();
+  const proxyM3u8Url = `${apiBase}/api/proxy/m3u8?url=${encodeURIComponent(masterHls)}`;
+  const playUrl = useDirect ? masterHls : proxyM3u8Url;
+
+  const isSafariOrIOS = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) || (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream);
+
+  if (window.Hls && Hls.isSupported()) {
+    currentHls = new Hls({
+      enableWorker: true,
+      lowLatencyMode: true,
+      backBufferLength: 15,
+      maxBufferLength: 8,
+      liveSyncDurationCount: 3,
+      manifestLoadingMaxRetry: 2,
+      levelLoadingMaxRetry: 2
     });
 
-    showOverlay(false);
+    currentHls.loadSource(playUrl);
+    currentHls.attachMedia(videoElement);
+
+    videoElement.muted = true;
+    updateSoundButton();
+
+    currentHls.on(Hls.Events.MANIFEST_PARSED, () => {
+      videoElement.play().then(() => {
+        showOverlay(false);
+        checkMutedState();
+      }).catch(() => {
+        showOverlay(false);
+        checkMutedState();
+      });
+    });
+
+    currentHls.on(Hls.Events.ERROR, (event, data) => {
+      if (data.fatal) {
+        console.warn('HLS fatal error:', data.type);
+        if (!useDirect) {
+          destroyPlayer();
+          initHlsPlayer(true);
+        } else if (currentStreamData.streams.bestFlv && mpegts.isSupported()) {
+          destroyPlayer();
+          engineSelect.value = 'flv';
+          initFlvPlayer(null, true);
+        } else {
+          destroyPlayer();
+          showOverlay(true, 'Não foi possível reproduzir este formato. Tente mudar o protocolo para FLV.', true);
+        }
+      }
+    });
+  } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
+    // Native iOS Safari
+    videoElement.src = masterHls;
+    videoElement.muted = true;
+    updateSoundButton();
+    videoElement.play().then(() => {
+      showOverlay(false);
+      checkMutedState();
+    }).catch(() => {
+      showOverlay(false);
+      checkMutedState();
+    });
   } else {
-    showOverlay(true, 'O navegador móvel não suporta FLV nativamente. Use o player HLS.', true);
+    engineSelect.value = 'flv';
+    initFlvPlayer(null, true);
   }
 }
 
 function destroyPlayer() {
+  clearTimeout(playAttemptTimeout);
+  clearTimeout(bufferWarningTimeout);
   if (currentHls) {
     try { currentHls.destroy(); } catch {}
     currentHls = null;
@@ -368,6 +504,33 @@ function destroyPlayer() {
     try { currentFlvPlayer.destroy(); } catch {}
     currentFlvPlayer = null;
   }
+  videoElement.pause();
+  videoElement.removeAttribute('src');
+  videoElement.load();
+  hideUnmuteOverlay();
+}
+
+function showOfflineCard(username, title) {
+  if (offlineTitle) offlineTitle.textContent = `@${username} está OFFLINE`;
+  if (offlineMessage) offlineMessage.textContent = title ? `Última live gravada: "${title}"` : 'Este perfil não está transmitindo ao vivo no momento.';
+  if (offlineCard) offlineCard.classList.remove('hidden');
+}
+
+function hideOfflineCard() {
+  if (offlineCard) offlineCard.classList.add('hidden');
+}
+
+function checkMutedState() {
+  if (videoElement.muted) {
+    if (btnUnmuteOverlay) btnUnmuteOverlay.classList.remove('hidden');
+  } else {
+    hideUnmuteOverlay();
+  }
+}
+
+function hideUnmuteOverlay() {
+  if (btnUnmuteOverlay) btnUnmuteOverlay.classList.add('hidden');
+}
   videoElement.pause();
   videoElement.removeAttribute('src');
   videoElement.load();
