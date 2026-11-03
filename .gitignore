@@ -1,0 +1,6 @@
+node_modules/
+functions/
+.firebaserc
+firebase.json
+*.log
+.DS_Store
