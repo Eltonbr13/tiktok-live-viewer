@@ -1,0 +1,28 @@
+{
+  "name": "tiktok-live-viewer",
+  "version": "1.0.0",
+  "description": "Assistir lives do TikTok em tempo real sem login e sem salvar dados",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "cli": "node cli.js"
+  },
+  "keywords": [
+    "tiktok",
+    "live",
+    "stream",
+    "hls",
+    "flv",
+    "render"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "tiktok-live-connector": "^2.1.8"
+  }
+}
