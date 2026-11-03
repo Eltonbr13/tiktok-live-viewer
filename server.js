@@ -125,6 +125,8 @@ app.get('/api/proxy/stream', async (req, res) => {
 
     res.status(cdnRes.status);
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Connection', 'keep-alive');
 
     const contentType = cdnRes.headers.get('content-type');
     if (contentType) {
@@ -140,6 +142,8 @@ app.get('/api/proxy/stream', async (req, res) => {
 
     const contentRange = cdnRes.headers.get('content-range');
     if (contentRange) res.setHeader('Content-Range', contentRange);
+
+    if (res.flushHeaders) res.flushHeaders();
 
     if (cdnRes.body) {
       const stream = Readable.fromWeb(cdnRes.body);
