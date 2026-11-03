@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: tiktok-live-viewer
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
