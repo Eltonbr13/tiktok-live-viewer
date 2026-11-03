@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0c10">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>TikTok Live Viewer - 100% Sem Login</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔴</text></svg>">
+  <link rel="stylesheet" href="style.css">
+  <!-- Local Player Libraries -->
+  <script src="libs/hls.min.js"></script>
+  <script src="libs/mpegts.js"></script>
+</head>
+<body class="mobile-layout-split">
+  <div class="app-container">
+    <!-- Top Header -->
+    <header class="app-header">
+      <div class="header-top-row">
+        <div class="logo-group">
+          <div class="logo-icon">
+            <span class="live-dot"></span>
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
+              <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.89 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.31 0 .61.05.89.14V9.45a6.3 6.3 0 0 0-.89-.06 6.34 6.34 0 1 0 6.34 6.34V8.46a8.27 8.27 0 0 0 4.76 1.5V6.51a4.8 4.8 0 0 1-1-.02z"/>
+            </svg>
+          </div>
+          <div class="logo-titles">
+            <h1>TikTok Live</h1>
+            <span class="badge-tag">Sem Login • Tempo Real</span>
+          </div>
+        </div>
+
+        <div class="header-tools">
+          <!-- Mobile Mode Toggle Button -->
+          <button id="btn-toggle-viewmode" class="btn-icon-circle" title="Alternar Modo App TikTok / Dividido">
+            <span id="viewmode-icon">📱</span>
+          </button>
+          <!-- Settings (Backend URL for free local/tunnel hosting) -->
+          <button id="btn-settings" class="btn-icon-circle" title="Configurações do Servidor">
+            ⚙️
+          </button>
+        </div>
+      </div>
+
+      <!-- Search and Connect Input -->
+      <div class="search-section">
+        <form id="search-form" class="search-form">
+          <div class="input-wrapper">
+            <span class="input-icon">@</span>
+            <input 
+              type="text" 
+              id="username-input" 
+              placeholder="Digite o @usuário ou link da live" 
+              autocomplete="off" 
+              autocapitalize="none"
+              autocorrect="off"
+              required
+            />
+          </div>
+          <button type="submit" id="btn-submit" class="btn-primary">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+              <path d="M8 5v14l11-7z"/>
+            </svg>
+            <span>Assistir</span>
+          </button>
+        </form>
+      </div>
+
+      <!-- Quick Streamers Bar -->
+      <div class="quick-bar">
+        <div id="quick-channels" class="quick-chips">
+          <!-- Dynamically filled with saved streamer chips -->
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Workspace Layout -->
+    <main class="main-layout" id="main-layout">
+      <!-- Left Column: Video & Stream Meta -->
+      <section class="video-column">
+        <!-- Video Wrapper -->
+        <div id="player-container" class="player-container ratio-9-16">
+          <video id="live-video" playsinline webkit-playsinline controls preload="auto"></video>
+          
+          <!-- Floating Heart Animation Container (Double Tap Effect) -->
+          <div id="hearts-container" class="hearts-container"></div>
+
+          <!-- Overlay Messages -->
+          <div id="player-overlay" class="player-overlay hidden">
+            <div class="overlay-content">
+              <div class="spinner" id="overlay-spinner"></div>
+              <p id="overlay-text">Aguardando transmissão...</p>
+              <button id="btn-retry" class="btn-secondary hidden">Tentar Novamente</button>
+            </div>
+          </div>
+
+          <!-- Live Floating Badges on Player -->
+          <div class="player-badges">
+            <div id="badge-live" class="live-pill offline">
+              <span class="pill-dot"></span>
+              <span id="live-status-text">OFFLINE</span>
+            </div>
+            <div id="badge-viewers" class="viewer-pill hidden">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor">
+                <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+              </svg>
+              <span id="viewer-count">0</span>
+            </div>
+          </div>
+
+          <!-- Floating Floating Action Buttons (TikTok App Mode) -->
+          <div class="player-floating-actions">
+            <button id="btn-float-chat" class="float-btn" title="Exibir/Ocultar Chat">💬</button>
+            <button id="btn-float-sound" class="float-btn" title="Ativar/Desativar Som">🔊</button>
+            <button id="btn-float-ratio" class="float-btn" title="Alternar Proporção">🔄</button>
+            <button id="btn-float-likes" class="float-btn like-pulse" title="Curtir">❤️</button>
+          </div>
+
+          <!-- Floating Streamer Bar (TikTok App Mode) -->
+          <div class="player-floating-streamer" id="floating-streamer-info">
+            <img id="floating-avatar" src="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1 1%22/>" alt="" class="float-avatar" />
+            <div class="float-info">
+              <span id="floating-name" class="float-name">Canal</span>
+              <span id="floating-title" class="float-title">Ao vivo</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Video Control Bar -->
+        <div class="player-controls-bar">
+          <div class="controls-left">
+            <div class="control-group">
+              <label for="quality-select">Qualidade:</label>
+              <select id="quality-select" class="select-control">
+                <option value="auto">Auto (HLS)</option>
+              </select>
+            </div>
+            <div class="control-group">
+              <label for="engine-select">Protocolo:</label>
+              <select id="engine-select" class="select-control">
+                <option value="hls">HLS (Recomendado)</option>
+                <option value="flv">FLV (Baixa Latência)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="controls-right">
+            <button id="btn-toggle-ratio" class="btn-icon" title="Alternar Formato (Vertical 9:16 / Horizontal 16:9)">
+              <span>🔄 Formato</span>
+            </button>
+            <button id="btn-theater" class="btn-icon desktop-only" title="Modo Cinema">
+              <span>Cinema</span>
+            </button>
+            <button id="btn-external-player" class="btn-icon desktop-only" title="Abrir no VLC">
+              <span>VLC</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Streamer Details Card -->
+        <div class="streamer-card">
+          <div class="streamer-profile">
+            <div class="avatar-wrapper">
+              <img id="streamer-avatar" src="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1 1%22/>" alt="Avatar" class="avatar-img" />
+              <div class="avatar-ring"></div>
+            </div>
+            <div class="streamer-text">
+              <div class="streamer-title-row">
+                <h2 id="streamer-name">Nenhum canal selecionado</h2>
+                <a id="streamer-link" href="#" target="_blank" rel="noopener noreferrer" class="channel-link hidden">
+                  TikTok ↗
+                </a>
+              </div>
+              <p id="stream-title" class="stream-title">Insira o @usuario acima para começar.</p>
+              <div class="stream-stats-bar">
+                <span id="stat-viewers" class="stat-item">👁️ 0</span>
+                <span id="stat-likes" class="stat-item">❤️ 0</span>
+                <span id="stat-room" class="stat-item">🆔 -</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Quick Action Buttons -->
+          <div class="streamer-actions">
+            <button id="btn-copy-m3u8" class="btn-chip" title="Copiar URL HLS">
+              <span>📋 M3U8</span>
+            </button>
+            <button id="btn-copy-flv" class="btn-chip" title="Copiar URL FLV">
+              <span>📋 FLV</span>
+            </button>
+            <button id="btn-save-channel" class="btn-chip" title="Salvar canal">
+              <span>⭐ Salvar</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column / Bottom Mobile: Real-Time Live Chat -->
+      <aside class="chat-column" id="chat-column">
+        <div class="chat-card">
+          <!-- Chat Header -->
+          <div class="chat-header">
+            <div class="chat-header-title">
+              <span class="chat-live-dot"></span>
+              <h3>Chat em Tempo Real</h3>
+            </div>
+            <div class="chat-header-actions">
+              <label class="toggle-label" title="Rolar automaticamente">
+                <input type="checkbox" id="chat-autoscroll" checked>
+                <span>Auto-rolar</span>
+              </label>
+              <button id="btn-clear-chat" class="btn-text">Limpar</button>
+            </div>
+          </div>
+
+          <!-- Chat Message Feed -->
+          <div id="chat-messages" class="chat-messages">
+            <div class="chat-placeholder">
+              <p>O chat ao vivo aparecerá aqui em tempo real.</p>
+            </div>
+          </div>
+
+          <!-- Chat Footer -->
+          <div class="chat-footer">
+            <div id="chat-status" class="chat-status-text">Status: Desconectado</div>
+            <div id="likes-ticker" class="likes-ticker">❤️ 0</div>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <!-- Settings Modal (Backend URL Config for 100% Free Hosting) -->
+  <div id="settings-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>⚙️ Configuração do Servidor</h3>
+        <button id="btn-close-settings" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-description">
+          Para rodar <strong>100% gratuitamente</strong> sem pagar servidores em nuvem, você pode apontar o app para o seu servidor local (PC na mesma rede Wi-Fi) ou para um túnel gratuito (LocalTunnel/Render).
+        </p>
+        <div class="form-group">
+          <label for="backend-url-input">URL da API / Backend:</label>
+          <input 
+            type="text" 
+            id="backend-url-input" 
+            placeholder="Ex: http://192.168.1.15:3000 ou vazio para padrão"
+          />
+          <small class="help-text">Deixe em branco para usar o mesmo domínio (padrão local ou Firebase Functions).</small>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-reset-backend" class="btn-secondary">Padrão</button>
+          <button id="btn-save-backend" class="btn-primary">Salvar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- Frontend Logic -->
+  <script src="app.js"></script>
+</body>
+</html>
