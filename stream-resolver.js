@@ -19,6 +19,43 @@ function normalizeUsername(input) {
 }
 
 /**
+ * Parses stream URLs from streamData object (present in fast room API)
+ */
+function parseStreamData(streamDataObj) {
+  if (!streamDataObj?.pull_data?.stream_data) return null;
+  try {
+    const parsed = typeof streamDataObj.pull_data.stream_data === 'string'
+      ? JSON.parse(streamDataObj.pull_data.stream_data)
+      : streamDataObj.pull_data.stream_data;
+
+    const data = parsed?.data || {};
+    const flvMap = {};
+    let hlsMaster = '';
+
+    const qualityOrder = [
+      { key: 'origin', label: 'ORIGION' },
+      { key: 'uhd', label: 'FULL_HD1' },
+      { key: 'hd', label: 'HD1' },
+      { key: 'sd', label: 'SD2' },
+      { key: 'ld', label: 'SD1' }
+    ];
+
+    for (const q of qualityOrder) {
+      const qData = data[q.key]?.main;
+      if (qData) {
+        if (qData.flv) flvMap[q.label] = qData.flv;
+        if (!hlsMaster && qData.hls) hlsMaster = qData.hls;
+      }
+    }
+
+    if (!hlsMaster && Object.keys(flvMap).length === 0) return null;
+    return { flvMap, hlsMaster };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
  * Resolves room info and stream URLs for a TikTok user without requiring login.
  */
 async function getLiveStreamData(username) {
@@ -29,7 +66,7 @@ async function getLiveStreamData(username) {
 
   const conn = new TikTokLiveConnection(cleanUser, {});
 
-  // 1. Fetch user & room status from TikTok Web API
+  // 1. Fetch user & room status from TikTok Web API (Fast endpoint ~700ms)
   const apiLiveRes = await conn.webClient.getJsonObjectFromTikTokApi('api-live/user/room/', {
     ...conn.webClient.clientParams,
     uniqueId: cleanUser,
@@ -42,7 +79,8 @@ async function getLiveStreamData(username) {
 
   const user = apiLiveRes.data?.user || {};
   const roomId = user.roomId;
-  const liveRoomStatus = apiLiveRes.data?.liveRoom?.status;
+  const liveRoom = apiLiveRes.data?.liveRoom || {};
+  const liveRoomStatus = liveRoom.status;
 
   if (!roomId) {
     return {
@@ -53,30 +91,37 @@ async function getLiveStreamData(username) {
     };
   }
 
-  // 2. Fetch detailed room info from Webcast API
-  const roomInfoRes = await conn.webClient.getJsonObjectFromWebcastApi('room/info/', {
-    ...conn.webClient.clientParams,
-    room_id: roomId
-  }, false);
-
-  const roomData = roomInfoRes?.data || {};
-  const streamUrlObj = roomData.stream_url || {};
-
   // Status: 2 is LIVE, 4 is OFFLINE
-  const isLive = roomData.status === 2 || liveRoomStatus === 2;
+  let isLive = liveRoomStatus === 2;
+  let roomData = {};
+  let flvMap = {};
+  let hlsUrl = '';
+  let rtmpUrl = '';
 
-  // Process stream URLs
-  const flvMap = streamUrlObj.flv_pull_url || {};
-  const hlsUrl = streamUrlObj.hls_pull_url || '';
-  const rtmpUrl = streamUrlObj.rtmp_pull_url || '';
+  // 2. Try fast stream resolution directly from liveRoom.streamData
+  const fastStreams = parseStreamData(liveRoom.streamData);
+  if (fastStreams) {
+    flvMap = fastStreams.flvMap;
+    hlsUrl = fastStreams.hlsMaster;
+  }
 
-  // Parse stream_data from pull_data if available
-  let rawStreamData = null;
-  if (streamUrlObj.pull_data?.stream_data) {
+  // 3. Fallback to Webcast room/info only if live and streams were not in streamData
+  if (isLive && (!hlsUrl || Object.keys(flvMap).length === 0)) {
     try {
-      rawStreamData = JSON.parse(streamUrlObj.pull_data.stream_data);
-    } catch {
-      // ignore
+      const roomInfoRes = await conn.webClient.getJsonObjectFromWebcastApi('room/info/', {
+        ...conn.webClient.clientParams,
+        room_id: roomId
+      }, false);
+
+      roomData = roomInfoRes?.data || {};
+      const streamUrlObj = roomData.stream_url || {};
+      if (roomData.status === 2) isLive = true;
+
+      flvMap = streamUrlObj.flv_pull_url || flvMap;
+      hlsUrl = streamUrlObj.hls_pull_url || hlsUrl;
+      rtmpUrl = streamUrlObj.rtmp_pull_url || '';
+    } catch (e) {
+      console.warn('Fallback webcast room/info falhou, usando dados do apiLive:', e.message);
     }
   }
 
@@ -88,7 +133,7 @@ async function getLiveStreamData(username) {
     qualities.push({
       format: 'hls',
       quality: 'auto',
-      label: 'HLS (Auto / Recomendado)',
+      label: 'HLS (Auto / Estável)',
       url: hlsUrl
     });
   }
@@ -113,21 +158,26 @@ async function getLiveStreamData(username) {
     }
   }
 
+  const avatar = user.avatarThumb?.url_list?.[0]
+    || roomData.owner?.avatar_thumb?.url_list?.[0]
+    || liveRoom.coverUrl
+    || '';
+
   return {
     username: cleanUser,
     isLive: isLive,
     status: isLive ? 'live' : 'offline',
     roomId: roomId,
-    title: roomData.title || apiLiveRes.data?.liveRoom?.title || 'Live sem título',
+    title: liveRoom.title || roomData.title || 'Live sem título',
     owner: {
-      id: roomData.owner?.id_str || user.id,
-      nickname: roomData.owner?.nickname || cleanUser,
-      displayId: roomData.owner?.display_id || cleanUser,
-      avatar: roomData.owner?.avatar_thumb?.url_list?.[0] || '',
-      followCount: roomData.owner?.follow_info?.follow_status || 0
+      id: user.id || roomData.owner?.id_str || roomId,
+      nickname: user.nickname || roomData.owner?.nickname || cleanUser,
+      displayId: user.uniqueId || roomData.owner?.display_id || cleanUser,
+      avatar: avatar,
+      followCount: user.followInfo?.followStatus || 0
     },
     stats: {
-      viewerCount: roomData.user_count || 0,
+      viewerCount: liveRoom.liveRoomStats?.userCount || roomData.user_count || 0,
       totalUsers: roomData.total_user || 0
     },
     streams: {
