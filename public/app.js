@@ -230,7 +230,7 @@ async function loadStreamer(username) {
     updateUI(currentStreamData);
 
     addRecentChannel(currentStreamData.username);
-    connectChat(currentStreamData.username);
+    connectChat(currentStreamData.username, currentStreamData.roomId);
 
     if (currentStreamData.isLive) {
       hideOfflineCard();
@@ -298,9 +298,9 @@ function initPlayer() {
   const quality = qualitySelect.value;
   const isSafariOrIOS = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) || (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream);
 
-  // Auto-detect optimal protocol for the platform if user hasn't explicitly chosen
+  // Default to HLS for maximum buffer stability and zero freezing
   if (!engineSelect.dataset.userChanged) {
-    engineSelect.value = isSafariOrIOS ? 'hls' : 'flv';
+    engineSelect.value = 'hls';
   }
 
   let preferredEngine = engineSelect.value;
@@ -366,9 +366,9 @@ function initFlvPlayer(selectedQuality = null, useProxy = false) {
       }, {
         enableWorker: true,
         lazyLoad: false,
-        enableStashBuffer: false,
-        stashInitialSize: 64,
-        liveBufferLatencyChasing: true,
+        enableStashBuffer: true,
+        stashInitialSize: 384,
+        liveBufferLatencyChasing: false,
         autoCleanupSourceBuffer: true
       });
 
@@ -436,11 +436,13 @@ function initHlsPlayer(useDirect = false) {
     currentHls = new Hls({
       enableWorker: true,
       lowLatencyMode: true,
-      backBufferLength: 15,
-      maxBufferLength: 8,
+      backBufferLength: 30,
+      maxBufferLength: 20,
+      maxMaxBufferLength: 40,
       liveSyncDurationCount: 3,
-      manifestLoadingMaxRetry: 2,
-      levelLoadingMaxRetry: 2
+      liveMaxLatencyDurationCount: 6,
+      manifestLoadingMaxRetry: 3,
+      levelLoadingMaxRetry: 3
     });
 
     currentHls.loadSource(playUrl);
@@ -569,14 +571,15 @@ function populateQualitySelector(qualities) {
 // ========================================================
 // Real-Time Live Chat via SSE
 // ========================================================
-function connectChat(username) {
+function connectChat(username, roomId) {
   disconnectChat();
 
   chatStatus.textContent = 'Conectando ao chat...';
   chatMessages.innerHTML = '';
 
   const apiBase = getApiBaseUrl();
-  chatEventSource = new EventSource(`${apiBase}/api/live/chat?user=${encodeURIComponent(username)}`);
+  const roomParam = roomId ? `&roomId=${encodeURIComponent(roomId)}` : '';
+  chatEventSource = new EventSource(`${apiBase}/api/live/chat?user=${encodeURIComponent(username)}${roomParam}`);
 
   chatEventSource.onopen = () => {
     chatStatus.textContent = 'Ao vivo no chat';
@@ -641,11 +644,13 @@ function handleChatMessage(data) {
 
     case 'chatError':
       chatStatus.textContent = data.message;
+      addSystemNotice(`ℹ️ ${data.message}`);
       break;
   }
 }
 
 function appendChatComment(msg) {
+  if (!msg.comment && !msg.user) return;
   const item = document.createElement('div');
   item.className = 'chat-item';
 
