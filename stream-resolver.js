@@ -98,11 +98,13 @@ async function getLiveStreamData(username) {
   let hlsUrl = '';
   let rtmpUrl = '';
 
-  // 2. Try fast stream resolution directly from liveRoom.streamData
-  const fastStreams = parseStreamData(liveRoom.streamData);
-  if (fastStreams) {
-    flvMap = fastStreams.flvMap;
-    hlsUrl = fastStreams.hlsMaster;
+  // 2. Try fast stream resolution directly from liveRoom.streamData (only if live)
+  if (isLive) {
+    const fastStreams = parseStreamData(liveRoom.streamData);
+    if (fastStreams) {
+      flvMap = fastStreams.flvMap;
+      hlsUrl = fastStreams.hlsMaster;
+    }
   }
 
   // 3. Fallback to Webcast room/info only if live and streams were not in streamData
