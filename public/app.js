@@ -171,6 +171,11 @@ document.addEventListener('DOMContentLoaded', () => {
     showOverlay(false);
   });
 
+  videoElement.addEventListener('canplay', () => {
+    clearTimeout(playAttemptTimeout);
+    showOverlay(false);
+  });
+
   videoElement.addEventListener('waiting', () => {
     // If buffering persists for > 5s, warn user
     clearTimeout(bufferWarningTimeout);
@@ -230,15 +235,17 @@ async function loadStreamer(username) {
     updateUI(currentStreamData);
 
     addRecentChannel(currentStreamData.username);
-    connectChat(currentStreamData.username, currentStreamData.roomId);
 
     if (currentStreamData.isLive) {
       hideOfflineCard();
       populateQualitySelector(currentStreamData.streams.qualities);
       initPlayer();
+      connectChat(currentStreamData.username, currentStreamData.roomId);
     } else {
       showOfflineCard(currentStreamData.username, currentStreamData.title);
       showOverlay(false);
+      chatMessages.innerHTML = '';
+      addSystemNotice('⚪ Canal offline no momento. O chat estará disponível quando a live iniciar.');
     }
   } catch (err) {
     console.error('Erro:', err);
@@ -414,7 +421,7 @@ function initFlvPlayer(selectedQuality = null, useProxy = false) {
   }
 }
 
-function initHlsPlayer(useDirect = false) {
+function initHlsPlayer(useDirect = false, proxySegments = false) {
   const masterHls = currentStreamData.streams.hlsMaster;
   if (!masterHls) {
     if (currentStreamData.streams.bestFlv && mpegts.isSupported()) {
@@ -427,7 +434,7 @@ function initHlsPlayer(useDirect = false) {
   }
 
   const apiBase = getApiBaseUrl();
-  const proxyM3u8Url = `${apiBase}/api/proxy/m3u8?url=${encodeURIComponent(masterHls)}`;
+  const proxyM3u8Url = `${apiBase}/api/proxy/m3u8?url=${encodeURIComponent(masterHls)}${proxySegments ? '&proxySegments=1' : ''}`;
   const playUrl = useDirect ? masterHls : proxyM3u8Url;
 
   const isSafariOrIOS = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) || (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream);
@@ -463,11 +470,17 @@ function initHlsPlayer(useDirect = false) {
 
     currentHls.on(Hls.Events.ERROR, (event, data) => {
       if (data.fatal) {
-        console.warn('HLS fatal error:', data.type);
-        if (!useDirect) {
+        console.warn('HLS fatal error:', data.type, data.details);
+        if (!useDirect && !proxySegments) {
+          // Fallback 1: proxy segments through server
           destroyPlayer();
-          initHlsPlayer(true);
+          initHlsPlayer(false, true);
+        } else if (!useDirect) {
+          // Fallback 2: direct master HLS
+          destroyPlayer();
+          initHlsPlayer(true, false);
         } else if (currentStreamData.streams.bestFlv && mpegts.isSupported()) {
+          // Fallback 3: FLV via proxy
           destroyPlayer();
           engineSelect.value = 'flv';
           initFlvPlayer(null, true);
@@ -533,10 +546,6 @@ function checkMutedState() {
 function hideUnmuteOverlay() {
   if (btnUnmuteOverlay) btnUnmuteOverlay.classList.add('hidden');
 }
-  videoElement.pause();
-  videoElement.removeAttribute('src');
-  videoElement.load();
-}
 
 function onEngineChange() {
   initPlayer();
@@ -576,6 +585,7 @@ function connectChat(username, roomId) {
 
   chatStatus.textContent = 'Conectando ao chat...';
   chatMessages.innerHTML = '';
+  addSystemNotice('🔄 Conectando ao chat ao vivo...');
 
   const apiBase = getApiBaseUrl();
   const roomParam = roomId ? `&roomId=${encodeURIComponent(roomId)}` : '';
