@@ -57,6 +57,7 @@ app.get('/api/live/info', async (req, res) => {
  */
 app.get('/api/proxy/m3u8', async (req, res) => {
   const targetUrl = req.query.url;
+  const proxySegments = req.query.proxySegments === '1';
   if (!targetUrl) {
     return res.status(400).send('URL missing');
   }
@@ -74,22 +75,46 @@ app.get('/api/proxy/m3u8', async (req, res) => {
     const baseUrl = new URL(targetUrl);
     const lines = text.split(/\r?\n/);
 
+    const resolveWithAuth = (rawUri) => {
+      try {
+        const resolved = new URL(rawUri, baseUrl);
+        // Preserve TikTok CDN auth query params (?expire=...&sign=...) when relative path lacks them
+        if (!resolved.search && baseUrl.search) {
+          resolved.search = baseUrl.search;
+        }
+        return resolved.toString();
+      } catch {
+        return rawUri;
+      }
+    };
+
     const rewritten = lines.map(line => {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) {
+      if (!trimmed) return line;
+
+      // Rewrite URI="..." inside tags like #EXT-X-MAP or #EXT-X-KEY
+      if (trimmed.startsWith('#')) {
+        if (trimmed.includes('URI="')) {
+          return line.replace(/URI="([^"]+)"/g, (_, uri) => {
+            const absUri = resolveWithAuth(uri);
+            const target = proxySegments
+              ? `/api/proxy/stream?url=${encodeURIComponent(absUri)}`
+              : absUri;
+            return `URI="${target}"`;
+          });
+        }
         return line;
       }
-      let absoluteUrl;
-      try {
-        absoluteUrl = new URL(trimmed, baseUrl).toString();
-      } catch {
-        absoluteUrl = trimmed;
-      }
+
+      const absoluteUrl = resolveWithAuth(trimmed);
 
       if (absoluteUrl.includes('.m3u8')) {
-        return `/api/proxy/m3u8?url=${encodeURIComponent(absoluteUrl)}`;
+        const ps = proxySegments ? '&proxySegments=1' : '';
+        return `/api/proxy/m3u8?url=${encodeURIComponent(absoluteUrl)}${ps}`;
+      } else if (proxySegments) {
+        return `/api/proxy/stream?url=${encodeURIComponent(absoluteUrl)}`;
       } else {
-        // Direct to CDN for video segments: zero Render CPU load, zero lag, smooth playback!
+        // Direct to CDN for video segments (with preserved auth query params): zero Render CPU load!
         return absoluteUrl;
       }
     });
