@@ -64,14 +64,23 @@ async function getLiveStreamData(username) {
     throw new Error('Nome de usuário inválido.');
   }
 
-  const conn = new TikTokLiveConnection(cleanUser, {});
-
-  // 1. Fetch user & room status from TikTok Web API (Fast endpoint ~700ms)
-  const apiLiveRes = await conn.webClient.getJsonObjectFromTikTokApi('api-live/user/room/', {
-    ...conn.webClient.clientParams,
-    uniqueId: cleanUser,
-    sourceType: '54'
-  });
+  // 1. Fetch user & room status from TikTok Web API (with 1 retry on transient 403)
+  let conn = new TikTokLiveConnection(cleanUser, {});
+  let apiLiveRes;
+  try {
+    apiLiveRes = await conn.webClient.getJsonObjectFromTikTokApi('api-live/user/room/', {
+      ...conn.webClient.clientParams,
+      uniqueId: cleanUser,
+      sourceType: '54'
+    });
+  } catch (err) {
+    conn = new TikTokLiveConnection(cleanUser, {});
+    apiLiveRes = await conn.webClient.getJsonObjectFromTikTokApi('api-live/user/room/', {
+      ...conn.webClient.clientParams,
+      uniqueId: cleanUser,
+      sourceType: '54'
+    });
+  }
 
   if (apiLiveRes?.statusCode !== 0 && !apiLiveRes?.data?.user) {
     throw new Error(apiLiveRes?.message || 'Falha ao buscar dados do usuário. Verifique o @username.');
