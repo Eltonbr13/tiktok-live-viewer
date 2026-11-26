@@ -305,30 +305,31 @@ function initPlayer() {
   const quality = qualitySelect.value;
   const isSafariOrIOS = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) || (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream);
 
-  // Default to HLS for maximum buffer stability and zero freezing
+  // Use FLV (Direct CDN) on all browsers supporting MSE (Android/PC) for true continuous real-time streaming;
+  // Use HLS on iOS Safari where MSE is unavailable.
   if (!engineSelect.dataset.userChanged) {
-    engineSelect.value = 'hls';
+    engineSelect.value = (!isSafariOrIOS && window.mpegts && mpegts.isSupported()) ? 'flv' : 'hls';
   }
 
   let preferredEngine = engineSelect.value;
 
-  // Timeout guard: if nothing plays in 6s, attempt fallback protocol
+  // Timeout guard: if nothing plays in 12s, attempt fallback protocol
   clearTimeout(playAttemptTimeout);
   playAttemptTimeout = setTimeout(() => {
-    if (videoElement.paused || videoElement.readyState < 2) {
+    if (videoElement.paused && videoElement.readyState < 2) {
       console.warn('Playback timeout on', preferredEngine, 'attempting auto-recovery...');
       showToast('Ajustando formato para acelerar reprodução...');
       if (preferredEngine === 'flv' && (Hls.isSupported() || isSafariOrIOS)) {
         engineSelect.value = 'hls';
-        initHlsPlayer(true);
-      } else if (preferredEngine === 'hls' && mpegts.isSupported()) {
+        initHlsPlayer(false);
+      } else if (preferredEngine === 'hls' && window.mpegts && mpegts.isSupported()) {
         engineSelect.value = 'flv';
-        initFlvPlayer(null, true);
+        initFlvPlayer(null, false);
       } else {
         showOverlay(true, 'O servidor do TikTok está instável. Tente clicar em Tentar Novamente ou mudar o protocolo.', true);
       }
     }
-  }, 6000);
+  }, 12000);
 
   if (preferredEngine === 'flv') {
     initFlvPlayer(quality);
@@ -374,9 +375,11 @@ function initFlvPlayer(selectedQuality = null, useProxy = false) {
         enableWorker: true,
         lazyLoad: false,
         enableStashBuffer: true,
-        stashInitialSize: 384,
+        stashInitialSize: 512,
         liveBufferLatencyChasing: false,
-        autoCleanupSourceBuffer: true
+        autoCleanupSourceBuffer: true,
+        autoCleanupMaxBackwardDuration: 15,
+        autoCleanupMinBackwardDuration: 8
       });
 
       currentFlvPlayer.attachMediaElement(videoElement);
@@ -426,7 +429,7 @@ function initHlsPlayer(useDirect = false, proxySegments = false) {
   if (!masterHls) {
     if (currentStreamData.streams.bestFlv && mpegts.isSupported()) {
       engineSelect.value = 'flv';
-      initFlvPlayer(null, true);
+      initFlvPlayer(null, false);
       return;
     }
     showOverlay(true, 'Nenhum link HLS disponível.', true);
@@ -480,10 +483,10 @@ function initHlsPlayer(useDirect = false, proxySegments = false) {
           destroyPlayer();
           initHlsPlayer(true, false);
         } else if (currentStreamData.streams.bestFlv && mpegts.isSupported()) {
-          // Fallback 3: FLV via proxy
+          // Fallback 3: FLV direct CDN first
           destroyPlayer();
           engineSelect.value = 'flv';
-          initFlvPlayer(null, true);
+          initFlvPlayer(null, false);
         } else {
           destroyPlayer();
           showOverlay(true, 'Não foi possível reproduzir este formato. Tente mudar o protocolo para FLV.', true);
@@ -504,7 +507,7 @@ function initHlsPlayer(useDirect = false, proxySegments = false) {
     });
   } else {
     engineSelect.value = 'flv';
-    initFlvPlayer(null, true);
+    initFlvPlayer(null, false);
   }
 }
 
