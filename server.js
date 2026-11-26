@@ -64,6 +64,7 @@ app.get('/api/proxy/m3u8', async (req, res) => {
 
   try {
     const cdnRes = await fetch(targetUrl, {
+      cache: 'no-store',
       headers: TIKTOK_CDN_HEADERS
     });
 
