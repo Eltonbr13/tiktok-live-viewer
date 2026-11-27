@@ -1,29 +1,33 @@
 /**
- * TikTok Live Stream Viewer - Mobile-Optimized Client Application
+ * TikTok Live Stream Viewer - Client Application
+ * Versão robusta: FLV direto via proxy no Render, chat com auto-reconexão
  */
 
-// Global State
+// ── Estado Global ──────────────────────────────────────────────────────────
 let currentStreamData = null;
 let currentHls = null;
 let currentFlvPlayer = null;
 let chatEventSource = null;
-let isTheaterMode = false;
-let isVerticalRatio = true;
+let chatReconnectTimer = null;
 let isAppMode = false;
 let isChatHidden = false;
+let isVerticalRatio = true;
+let isTheaterMode = false;
+let playAttemptTimeout = null;
+let bufferWarningTimeout = null;
+let playerInitializing = false;
+let currentEngine = 'flv';
+let chatConnectAttempt = 0;
 
-// Custom Backend Storage Key (allows 100% free hosting using local PC or free tunnel)
 const BACKEND_STORAGE_KEY = 'tiktok_live_viewer_backend_url';
+const CHANNELS_KEY = 'tiktok_live_viewer_saved_channels';
 
-function getApiBaseUrl() {
+function getApiBase() {
   const custom = localStorage.getItem(BACKEND_STORAGE_KEY);
-  if (custom && custom.trim()) {
-    return custom.trim().replace(/\/+$/, '');
-  }
-  return '';
+  return custom ? custom.trim().replace(/\/+$/, '') : '';
 }
 
-// DOM Elements
+// ── DOM ────────────────────────────────────────────────────────────────────
 const bodyEl = document.body;
 const searchForm = document.getElementById('search-form');
 const usernameInput = document.getElementById('username-input');
@@ -31,7 +35,6 @@ const btnSubmit = document.getElementById('btn-submit');
 const quickChannelsContainer = document.getElementById('quick-channels');
 
 const btnToggleViewMode = document.getElementById('btn-toggle-viewmode');
-const viewModeIcon = document.getElementById('viewModeIcon');
 const btnSettings = document.getElementById('btn-settings');
 const settingsModal = document.getElementById('settings-modal');
 const btnCloseSettings = document.getElementById('btn-close-settings');
@@ -56,8 +59,8 @@ const btnFloatChat = document.getElementById('btn-float-chat');
 const btnFloatSound = document.getElementById('btn-float-sound');
 const btnFloatRatio = document.getElementById('btn-float-ratio');
 const btnFloatLikes = document.getElementById('btn-float-likes');
-
 const btnUnmuteOverlay = document.getElementById('btn-unmute-overlay');
+
 const offlineCard = document.getElementById('offline-card');
 const offlineTitle = document.getElementById('offline-title');
 const offlineMessage = document.getElementById('offline-message');
@@ -93,15 +96,11 @@ const chatStatus = document.getElementById('chat-status');
 const likesTicker = document.getElementById('likes-ticker');
 const toastEl = document.getElementById('toast');
 
-// ========================================================
-// Initialization
-// ========================================================
+// ── Init ───────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   renderSavedChannels();
 
-  // Auto-detect mobile screen on initial load
   if (window.innerWidth <= 768) {
-    // Start in Split mode, user can toggle to TikTok App mode with 1 tap
     bodyEl.className = 'mobile-layout-split';
   }
 
@@ -111,24 +110,19 @@ document.addEventListener('DOMContentLoaded', () => {
     if (user) loadStreamer(user);
   });
 
-  // Mobile View Mode Toggle
   btnToggleViewMode.addEventListener('click', toggleViewMode);
-
-  // Settings Modal
   btnSettings.addEventListener('click', openSettings);
   btnCloseSettings.addEventListener('click', closeSettings);
   btnSaveBackend.addEventListener('click', saveBackendUrl);
   btnResetBackend.addEventListener('click', resetBackendUrl);
 
-  // Floating Actions
   btnFloatChat.addEventListener('click', toggleChatVisibility);
   btnFloatSound.addEventListener('click', toggleMute);
   btnFloatRatio.addEventListener('click', toggleVideoFit);
-  btnFloatLikes.addEventListener('click', (e) => {
-    triggerFloatingHeart(e.clientX || window.innerWidth - 60, e.clientY || window.innerHeight - 100);
-  });
+  btnFloatLikes.addEventListener('click', (e) => triggerFloatingHeart(
+    e.clientX || window.innerWidth - 60, e.clientY || window.innerHeight - 100
+  ));
 
-  // Double Tap on Video for Hearts
   setupDoubleTap(playerContainer);
 
   btnToggleRatio.addEventListener('click', toggleAspectRatio);
@@ -153,37 +147,27 @@ document.addEventListener('DOMContentLoaded', () => {
   if (btnCheckLive) {
     btnCheckLive.addEventListener('click', () => {
       if (currentStreamData?.username) {
-        showToast('Verificando status de @' + currentStreamData.username + '...');
+        showToast('Verificando @' + currentStreamData.username + '...');
         loadStreamer(currentStreamData.username);
       }
     });
   }
 
-  // Monitor video playback events to reliably clear loading overlay
-  videoElement.addEventListener('playing', () => {
-    clearTimeout(playAttemptTimeout);
-    showOverlay(false);
-    checkMutedState();
-  });
-
-  videoElement.addEventListener('loadeddata', () => {
-    clearTimeout(playAttemptTimeout);
-    showOverlay(false);
-  });
-
-  videoElement.addEventListener('canplay', () => {
-    clearTimeout(playAttemptTimeout);
-    showOverlay(false);
-  });
+  videoElement.addEventListener('playing', onVideoPlaying);
+  videoElement.addEventListener('loadeddata', onVideoPlaying);
+  videoElement.addEventListener('canplay', onVideoPlaying);
 
   videoElement.addEventListener('waiting', () => {
-    // If buffering persists for > 5s, warn user
     clearTimeout(bufferWarningTimeout);
     bufferWarningTimeout = setTimeout(() => {
-      if (!videoElement.paused && videoElement.readyState < 3) {
-        showToast('Conexão oscilando... tentando estabilizar');
+      if (videoElement.readyState < 3 && !videoElement.paused) {
+        showToast('Buffering... aguardando dados da live');
       }
     }, 5000);
+  });
+
+  videoElement.addEventListener('error', (e) => {
+    console.warn('[video] Erro no elemento de vídeo:', e);
   });
 
   btnCopyM3u8.addEventListener('click', () => copyStreamUrl('m3u8'));
@@ -192,12 +176,9 @@ document.addEventListener('DOMContentLoaded', () => {
   btnClearChat.addEventListener('click', clearChat);
 
   btnRetry.addEventListener('click', () => {
-    if (currentStreamData?.username) {
-      loadStreamer(currentStreamData.username);
-    }
+    if (currentStreamData?.username) loadStreamer(currentStreamData.username);
   });
 
-  // Check URL query parameters
   const params = new URLSearchParams(window.location.search);
   const initialUser = params.get('user');
   if (initialUser) {
@@ -206,68 +187,68 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 });
 
-let playAttemptTimeout = null;
-let bufferWarningTimeout = null;
+function onVideoPlaying() {
+  clearTimeout(playAttemptTimeout);
+  clearTimeout(bufferWarningTimeout);
+  showOverlay(false);
+  checkMutedState();
+  playerInitializing = false;
+}
 
-// ========================================================
-// Stream Loading & API Call
-// ========================================================
+// ── Stream Loading ─────────────────────────────────────────────────────────
 async function loadStreamer(username) {
   hideOfflineCard();
   hideUnmuteOverlay();
-  showOverlay(true, 'Consultando status da live de @' + username + '...');
+  showOverlay(true, 'Consultando @' + username + '...');
   btnSubmit.disabled = true;
 
   destroyPlayer();
   disconnectChat();
 
-  const apiBase = getApiBaseUrl();
+  const apiBase = getApiBase();
 
   try {
     const res = await fetch(`${apiBase}/api/live/info?user=${encodeURIComponent(username)}`);
+    if (!res.ok) throw new Error(`Servidor retornou ${res.status}`);
     const json = await res.json();
 
     if (!json.success || !json.data) {
-      throw new Error(json.error || 'Não foi possível carregar a live.');
+      throw new Error(json.error || 'Falha ao carregar dados.');
     }
 
     currentStreamData = json.data;
     updateUI(currentStreamData);
-
     addRecentChannel(currentStreamData.username);
 
     if (currentStreamData.isLive) {
       hideOfflineCard();
-      populateQualitySelector(currentStreamData.streams.qualities);
+      populateQualitySelector(currentStreamData.streams?.qualities || []);
       initPlayer();
       connectChat(currentStreamData.username, currentStreamData.roomId);
     } else {
       showOfflineCard(currentStreamData.username, currentStreamData.title);
       showOverlay(false);
       chatMessages.innerHTML = '';
-      addSystemNotice('⚪ Canal offline no momento. O chat estará disponível quando a live iniciar.');
+      addSystemNotice('⚪ Canal offline. O chat estará disponível quando a live iniciar.');
     }
   } catch (err) {
-    console.error('Erro:', err);
-    showOverlay(true, 'Erro ao carregar a live: ' + err.message, true);
+    console.error('[loadStreamer] Erro:', err);
+    showOverlay(true, 'Erro: ' + err.message, true);
     showToast('Erro: ' + err.message);
   } finally {
     btnSubmit.disabled = false;
   }
 }
 
-// ========================================================
-// UI Updates
-// ========================================================
+// ── UI ─────────────────────────────────────────────────────────────────────
 function updateUI(data) {
-  const displayName = data.owner.nickname || `@${data.username}`;
+  const displayName = data.owner?.nickname || `@${data.username}`;
   streamerName.textContent = displayName;
   streamTitle.textContent = data.title || 'Live sem título';
-
   floatingName.textContent = displayName;
   floatingTitle.textContent = data.title || 'Ao vivo';
 
-  if (data.owner.avatar) {
+  if (data.owner?.avatar) {
     streamerAvatar.src = data.owner.avatar;
     floatingAvatar.src = data.owner.avatar;
   }
@@ -275,14 +256,14 @@ function updateUI(data) {
   streamerLink.href = `https://www.tiktok.com/@${data.username}/live`;
   streamerLink.classList.remove('hidden');
 
-  statViewers.textContent = `👁️ ${formatNumber(data.stats.viewerCount)}`;
+  statViewers.textContent = `👁️ ${formatNumber(data.stats?.viewerCount || 0)}`;
   statRoom.textContent = `🆔 ${data.roomId || '-'}`;
 
   if (data.isLive) {
     badgeLive.className = 'live-pill online';
     liveStatusText.textContent = 'AO VIVO';
     badgeViewers.classList.remove('hidden');
-    viewerCountEl.textContent = formatNumber(data.stats.viewerCount);
+    viewerCountEl.textContent = formatNumber(data.stats?.viewerCount || 0);
   } else {
     badgeLive.className = 'live-pill offline';
     liveStatusText.textContent = 'OFFLINE';
@@ -292,167 +273,229 @@ function updateUI(data) {
   document.title = `${data.isLive ? '🔴 AO VIVO - ' : ''}@${data.username} | TikTok Live`;
 }
 
-// ========================================================
-// Video Player (Direct CDN + Proxy Fallback / HLS + FLV)
-// ========================================================
+// ── Video Player ───────────────────────────────────────────────────────────
 function initPlayer() {
-  if (!currentStreamData || !currentStreamData.streams) return;
-  if (!currentStreamData.isLive) return;
+  if (!currentStreamData?.streams || !currentStreamData.isLive) return;
+  if (playerInitializing) return;
+  playerInitializing = true;
 
   destroyPlayer();
-  showOverlay(true, 'Conectando ao stream ao vivo...');
+  showOverlay(true, 'Iniciando stream ao vivo...');
 
-  const quality = qualitySelect.value;
-  const isSafariOrIOS = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) || (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream);
+  const isSafariOrIOS = /^((?!chrome|android).)*safari/i.test(navigator.userAgent)
+    || (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream);
 
-  // Use FLV (Direct CDN) on all browsers supporting MSE (Android/PC) for true continuous real-time streaming;
-  // Use HLS on iOS Safari where MSE is unavailable.
+  // Determine best engine
   if (!engineSelect.dataset.userChanged) {
-    engineSelect.value = (!isSafariOrIOS && window.mpegts && mpegts.isSupported()) ? 'flv' : 'hls';
+    const canFLV = window.mpegts && mpegts.isSupported();
+    engineSelect.value = (!isSafariOrIOS && canFLV) ? 'flv' : 'hls';
   }
 
-  let preferredEngine = engineSelect.value;
+  currentEngine = engineSelect.value;
 
-  // Timeout guard: if nothing plays in 12s, attempt fallback protocol
+  // Fallback timer: if nothing plays in 15s, switch protocol once
   clearTimeout(playAttemptTimeout);
   playAttemptTimeout = setTimeout(() => {
-    if (videoElement.paused && videoElement.readyState < 2) {
-      console.warn('Playback timeout on', preferredEngine, 'attempting auto-recovery...');
-      showToast('Ajustando formato para acelerar reprodução...');
-      if (preferredEngine === 'flv' && (Hls.isSupported() || isSafariOrIOS)) {
+    if (playerInitializing || (videoElement.paused && videoElement.readyState < 2)) {
+      console.warn('[player] Timeout! Tentando protocolo alternativo...');
+      showToast('Ajustando protocolo...');
+      playerInitializing = false;
+
+      if (currentEngine === 'flv') {
+        currentEngine = 'hls';
         engineSelect.value = 'hls';
         initHlsPlayer(false);
-      } else if (preferredEngine === 'hls' && window.mpegts && mpegts.isSupported()) {
+      } else if (currentEngine === 'hls' && window.mpegts && mpegts.isSupported()) {
+        currentEngine = 'flv';
         engineSelect.value = 'flv';
-        initFlvPlayer(null, false);
+        initFlvPlayer();
       } else {
-        showOverlay(true, 'O servidor do TikTok está instável. Tente clicar em Tentar Novamente ou mudar o protocolo.', true);
+        showOverlay(true, 'Stream instável. Clique em Tentar Novamente ou troque o protocolo.', true);
       }
     }
-  }, 12000);
+  }, 15000);
 
-  if (preferredEngine === 'flv') {
-    initFlvPlayer(quality);
+  if (currentEngine === 'flv') {
+    initFlvPlayer();
   } else {
-    initHlsPlayer();
+    initHlsPlayer(false);
   }
 }
 
-function initFlvPlayer(selectedQuality = null, useProxy = false) {
-  let targetFlvUrl = '';
-
-  if (selectedQuality && currentStreamData.streams.flvMap[selectedQuality]) {
-    targetFlvUrl = currentStreamData.streams.flvMap[selectedQuality];
-  } else {
-    targetFlvUrl = currentStreamData.streams.bestFlv;
-  }
-
-  if (!targetFlvUrl) {
-    if (currentStreamData.streams.hlsMaster) {
-      engineSelect.value = 'hls';
-      initHlsPlayer(true);
-      return;
-    }
-    showOverlay(true, 'Nenhum stream FLV disponível no momento.', true);
+/**
+ * FLV Player via mpegts.js
+ * Always uses proxy on Render to avoid CORS issues with TikTok CDN auth headers.
+ */
+function initFlvPlayer(selectedQuality = null) {
+  if (!window.mpegts || !mpegts.isSupported()) {
+    console.log('[flv] mpegts não suportado, usando HLS');
+    engineSelect.value = 'hls';
+    currentEngine = 'hls';
+    initHlsPlayer(false);
     return;
   }
 
-  const apiBase = getApiBaseUrl();
-  const proxyFlvUrl = `${apiBase}/api/proxy/stream?url=${encodeURIComponent(targetFlvUrl)}`;
-  // Try direct TikTok CDN first for maximum speed and zero server lag; fallback to proxy if needed
-  const playUrl = useProxy ? proxyFlvUrl : targetFlvUrl;
+  const streams = currentStreamData.streams;
+  let flvUrl = '';
 
-  if (window.mpegts && mpegts.isSupported()) {
-    try {
-      currentFlvPlayer = mpegts.createPlayer({
-        type: 'flv',
-        isLive: true,
-        url: playUrl,
-        hasAudio: true,
-        hasVideo: true,
-        cors: true
-      }, {
-        enableWorker: true,
-        lazyLoad: false,
-        enableStashBuffer: true,
-        stashInitialSize: 512,
-        liveBufferLatencyChasing: false,
-        autoCleanupSourceBuffer: true,
-        autoCleanupMaxBackwardDuration: 15,
-        autoCleanupMinBackwardDuration: 8
-      });
+  if (selectedQuality && streams.flvMap?.[selectedQuality]) {
+    flvUrl = streams.flvMap[selectedQuality];
+  } else {
+    flvUrl = streams.bestFlv || '';
+  }
 
-      currentFlvPlayer.attachMediaElement(videoElement);
-      currentFlvPlayer.load();
+  if (!flvUrl) {
+    console.log('[flv] Sem URL FLV disponível, tentando HLS...');
+    if (streams.hlsMaster) {
+      engineSelect.value = 'hls';
+      currentEngine = 'hls';
+      initHlsPlayer(false);
+      return;
+    }
+    playerInitializing = false;
+    showOverlay(true, 'Nenhum stream disponível para esta live.', true);
+    return;
+  }
 
-      // Mobile autoplay requirement: start muted
-      videoElement.muted = true;
-      updateSoundButton();
+  // On Render, always proxy FLV through the server to handle CORS + auth
+  const apiBase = getApiBase();
+  const proxyUrl = `${apiBase}/api/proxy/stream?url=${encodeURIComponent(flvUrl)}`;
 
-      currentFlvPlayer.on(mpegts.Events.ERROR, (errType, errDetail) => {
-        console.warn('mpegts error:', errType, errDetail);
-        if (!useProxy) {
-          console.log('Retrying FLV via proxy...');
-          destroyPlayer();
-          initFlvPlayer(selectedQuality, true);
-        } else if (currentStreamData.streams.hlsMaster) {
-          console.log('Falling back to HLS...');
+  console.log('[flv] Iniciando player FLV via proxy...');
+
+  try {
+    if (currentFlvPlayer) {
+      try { currentFlvPlayer.destroy(); } catch {}
+      currentFlvPlayer = null;
+    }
+    videoElement.pause();
+    videoElement.removeAttribute('src');
+    videoElement.load();
+
+    currentFlvPlayer = mpegts.createPlayer({
+      type: 'flv',
+      isLive: true,
+      url: proxyUrl,
+      hasAudio: true,
+      hasVideo: true,
+      cors: true
+    }, {
+      enableWorker: true,
+      lazyLoad: false,
+      enableStashBuffer: true,
+      stashInitialSize: 384,
+      liveBufferLatencyChasing: true,
+      liveBufferLatencyMaxLatency: 10,
+      liveBufferLatencyMinRemain: 1.5,
+      autoCleanupSourceBuffer: true,
+      autoCleanupMaxBackwardDuration: 20,
+      autoCleanupMinBackwardDuration: 5,
+      fixAudioTimestampGap: true
+    });
+
+    currentFlvPlayer.attachMediaElement(videoElement);
+    currentFlvPlayer.load();
+
+    videoElement.muted = true;
+    updateSoundButton();
+
+    currentFlvPlayer.on(mpegts.Events.ERROR, (errType, errDetail, errInfo) => {
+      console.warn('[flv] Erro mpegts:', errType, errDetail, errInfo);
+      playerInitializing = false;
+
+      // On network error, try HLS as fallback
+      if (errType === mpegts.ErrorTypes.NETWORK_ERROR || errType === mpegts.ErrorTypes.IO_ERROR) {
+        if (currentStreamData.streams.hlsMaster) {
+          console.log('[flv] Fallback para HLS...');
           destroyPlayer();
           engineSelect.value = 'hls';
-          initHlsPlayer(true);
+          currentEngine = 'hls';
+          initHlsPlayer(false);
+        } else {
+          showOverlay(true, 'Erro de rede no stream. Clique em Tentar Novamente.', true);
         }
-      });
+      }
+    });
 
-      currentFlvPlayer.play().then(() => {
+    currentFlvPlayer.on(mpegts.Events.STATISTICS_INFO, (info) => {
+      // Stream is active - clear loading
+      if (info.speed > 0 && playerInitializing) {
+        clearTimeout(playAttemptTimeout);
+      }
+    });
+
+    const playPromise = currentFlvPlayer.play();
+    if (playPromise && typeof playPromise.then === 'function') {
+      playPromise.then(() => {
         showOverlay(false);
+        playerInitializing = false;
         checkMutedState();
       }).catch((e) => {
-        console.log('Autoplay muted play handled:', e);
+        console.log('[flv] autoplay muted:', e.message);
         showOverlay(false);
+        playerInitializing = false;
         checkMutedState();
       });
-    } catch (e) {
-      console.error('Erro ao instanciar mpegts:', e);
-      if (currentStreamData.streams.hlsMaster) {
-        initHlsPlayer(true);
-      }
     }
-  } else {
-    // Platform does not support MSE FLV (e.g. iOS Safari) -> auto use HLS
-    engineSelect.value = 'hls';
-    initHlsPlayer(true);
+  } catch (e) {
+    console.error('[flv] Erro ao instanciar player:', e);
+    playerInitializing = false;
+    if (currentStreamData.streams.hlsMaster) {
+      engineSelect.value = 'hls';
+      currentEngine = 'hls';
+      initHlsPlayer(false);
+    } else {
+      showOverlay(true, 'Erro ao iniciar player. Clique em Tentar Novamente.', true);
+    }
   }
 }
 
-function initHlsPlayer(useDirect = false, proxySegments = false) {
-  const masterHls = currentStreamData.streams.hlsMaster;
-  if (!masterHls) {
-    if (currentStreamData.streams.bestFlv && mpegts.isSupported()) {
+/**
+ * HLS Player via HLS.js (or native Safari)
+ */
+function initHlsPlayer(useDirect = false) {
+  const streams = currentStreamData.streams;
+  if (!streams.hlsMaster) {
+    if (streams.bestFlv && window.mpegts && mpegts.isSupported()) {
       engineSelect.value = 'flv';
-      initFlvPlayer(null, false);
+      currentEngine = 'flv';
+      initFlvPlayer();
       return;
     }
-    showOverlay(true, 'Nenhum link HLS disponível.', true);
+    playerInitializing = false;
+    showOverlay(true, 'Nenhum stream HLS disponível.', true);
     return;
   }
 
-  const apiBase = getApiBaseUrl();
-  const proxyM3u8Url = `${apiBase}/api/proxy/m3u8?url=${encodeURIComponent(masterHls)}${proxySegments ? '&proxySegments=1' : ''}`;
-  const playUrl = useDirect ? masterHls : proxyM3u8Url;
+  const apiBase = getApiBase();
+  const proxyUrl = `${apiBase}/api/proxy/m3u8?url=${encodeURIComponent(streams.hlsMaster)}`;
+  const playUrl = useDirect ? streams.hlsMaster : proxyUrl;
 
-  const isSafariOrIOS = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) || (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream);
+  console.log('[hls] Iniciando player HLS:', useDirect ? 'direto' : 'via proxy');
+
+  const isSafariOrIOS = /^((?!chrome|android).)*safari/i.test(navigator.userAgent)
+    || (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream);
 
   if (window.Hls && Hls.isSupported()) {
+    if (currentHls) {
+      try { currentHls.destroy(); } catch {}
+      currentHls = null;
+    }
+
     currentHls = new Hls({
       enableWorker: true,
       lowLatencyMode: true,
-      backBufferLength: 30,
-      maxBufferLength: 20,
-      maxMaxBufferLength: 40,
-      liveSyncDurationCount: 3,
-      liveMaxLatencyDurationCount: 6,
-      manifestLoadingMaxRetry: 3,
-      levelLoadingMaxRetry: 3
+      backBufferLength: 15,
+      maxBufferLength: 15,
+      maxMaxBufferLength: 30,
+      liveSyncDurationCount: 2,
+      liveMaxLatencyDurationCount: 5,
+      manifestLoadingMaxRetry: 5,
+      levelLoadingMaxRetry: 5,
+      fragLoadingMaxRetry: 5,
+      manifestLoadingRetryDelay: 1000,
+      levelLoadingRetryDelay: 1000,
+      fragLoadingRetryDelay: 1000
     });
 
     currentHls.loadSource(playUrl);
@@ -462,75 +505,242 @@ function initHlsPlayer(useDirect = false, proxySegments = false) {
     updateSoundButton();
 
     currentHls.on(Hls.Events.MANIFEST_PARSED, () => {
+      clearTimeout(playAttemptTimeout);
       videoElement.play().then(() => {
         showOverlay(false);
+        playerInitializing = false;
         checkMutedState();
       }).catch(() => {
         showOverlay(false);
+        playerInitializing = false;
         checkMutedState();
       });
     });
 
     currentHls.on(Hls.Events.ERROR, (event, data) => {
       if (data.fatal) {
-        console.warn('HLS fatal error:', data.type, data.details);
-        if (!useDirect && !proxySegments) {
-          // Fallback 1: proxy segments through server
+        console.warn('[hls] Erro fatal:', data.type, data.details);
+        playerInitializing = false;
+
+        if (!useDirect) {
+          // Try direct URL
           destroyPlayer();
-          initHlsPlayer(false, true);
-        } else if (!useDirect) {
-          // Fallback 2: direct master HLS
-          destroyPlayer();
-          initHlsPlayer(true, false);
-        } else if (currentStreamData.streams.bestFlv && mpegts.isSupported()) {
-          // Fallback 3: FLV direct CDN first
+          initHlsPlayer(true);
+        } else if (streams.bestFlv && window.mpegts && mpegts.isSupported()) {
+          // Fallback to FLV
           destroyPlayer();
           engineSelect.value = 'flv';
-          initFlvPlayer(null, false);
+          currentEngine = 'flv';
+          initFlvPlayer();
         } else {
-          destroyPlayer();
-          showOverlay(true, 'Não foi possível reproduzir este formato. Tente mudar o protocolo para FLV.', true);
+          showOverlay(true, 'Falha no stream HLS. Tente FLV no menu de protocolo.', true);
         }
       }
     });
   } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
-    // Native iOS Safari
-    videoElement.src = masterHls;
+    // Native iOS Safari HLS
+    videoElement.src = streams.hlsMaster;
     videoElement.muted = true;
     updateSoundButton();
     videoElement.play().then(() => {
       showOverlay(false);
+      playerInitializing = false;
       checkMutedState();
     }).catch(() => {
       showOverlay(false);
+      playerInitializing = false;
       checkMutedState();
     });
   } else {
-    engineSelect.value = 'flv';
-    initFlvPlayer(null, false);
+    playerInitializing = false;
+    showOverlay(true, 'Este navegador não suporta streaming de vídeo.', true);
   }
 }
 
 function destroyPlayer() {
   clearTimeout(playAttemptTimeout);
   clearTimeout(bufferWarningTimeout);
+  playerInitializing = false;
+
   if (currentHls) {
     try { currentHls.destroy(); } catch {}
     currentHls = null;
   }
+
   if (currentFlvPlayer) {
     try { currentFlvPlayer.destroy(); } catch {}
     currentFlvPlayer = null;
   }
+
   videoElement.pause();
   videoElement.removeAttribute('src');
   videoElement.load();
   hideUnmuteOverlay();
 }
 
+// ── Chat via SSE ───────────────────────────────────────────────────────────
+function connectChat(username, roomId) {
+  disconnectChat();
+
+  chatConnectAttempt++;
+  const thisAttempt = chatConnectAttempt;
+
+  chatStatus.textContent = 'Conectando ao chat...';
+  chatMessages.innerHTML = '';
+  addSystemNotice('🔄 Conectando ao chat ao vivo...');
+
+  const apiBase = getApiBase();
+  const roomParam = roomId ? `&roomId=${encodeURIComponent(roomId)}` : '';
+  const url = `${apiBase}/api/live/chat?user=${encodeURIComponent(username)}${roomParam}`;
+
+  chatEventSource = new EventSource(url);
+
+  chatEventSource.onopen = () => {
+    if (thisAttempt !== chatConnectAttempt) return;
+    chatStatus.textContent = 'Conectado';
+    console.log('[chat] SSE aberto');
+  };
+
+  chatEventSource.onmessage = (event) => {
+    if (thisAttempt !== chatConnectAttempt) return;
+    try {
+      const data = JSON.parse(event.data);
+      handleChatMessage(data);
+    } catch (e) {
+      console.error('[chat] Parse error:', e);
+    }
+  };
+
+  chatEventSource.onerror = (e) => {
+    if (thisAttempt !== chatConnectAttempt) return;
+    console.warn('[chat] SSE erro, reconectando em 5s...');
+    chatStatus.textContent = 'Reconectando chat...';
+
+    // Auto-reconnect after delay
+    clearTimeout(chatReconnectTimer);
+    chatReconnectTimer = setTimeout(() => {
+      if (currentStreamData?.isLive && thisAttempt === chatConnectAttempt) {
+        console.log('[chat] Tentando reconectar...');
+        connectChat(username, roomId);
+      }
+    }, 5000);
+  };
+}
+
+function disconnectChat() {
+  chatConnectAttempt++;
+  clearTimeout(chatReconnectTimer);
+  if (chatEventSource) {
+    try { chatEventSource.close(); } catch {}
+    chatEventSource = null;
+  }
+  chatStatus.textContent = 'Desconectado';
+}
+
+function handleChatMessage(data) {
+  switch (data.type) {
+    case 'status':
+      chatStatus.textContent = data.message;
+      break;
+    case 'connected':
+      chatStatus.textContent = '💬 Ao vivo';
+      addSystemNotice(data.message);
+      break;
+    case 'chat':
+      appendChatComment(data);
+      break;
+    case 'gift':
+      appendGiftNotice(data);
+      break;
+    case 'like':
+      likesTicker.textContent = `❤️ ${formatNumber(data.totalLikes || data.likeCount || 0)}`;
+      statLikes.textContent = `❤️ ${formatNumber(data.totalLikes || data.likeCount || 0)}`;
+      break;
+    case 'viewers':
+      viewerCountEl.textContent = formatNumber(data.viewerCount);
+      statViewers.textContent = `👁️ ${formatNumber(data.viewerCount)}`;
+      break;
+    case 'streamEnd':
+      addSystemNotice('⚠️ A live foi encerrada.');
+      badgeLive.className = 'live-pill offline';
+      liveStatusText.textContent = 'ENCERRADA';
+      break;
+    case 'chatError':
+      chatStatus.textContent = '⚠️ Chat: ' + (data.message || 'erro');
+      addSystemNotice(`ℹ️ ${data.message}`);
+      break;
+    case 'disconnected':
+      chatStatus.textContent = 'Chat desconectado';
+      break;
+  }
+}
+
+function appendChatComment(msg) {
+  if (!msg.comment && !msg.user) return;
+
+  const item = document.createElement('div');
+  item.className = 'chat-item';
+
+  const avatar = msg.avatar || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"/>';
+
+  let badgesHtml = '';
+  if (msg.isModerator) badgesHtml += '<span class="chat-badge mod">MOD</span>';
+  if (msg.isSubscriber) badgesHtml += '<span class="chat-badge sub">SUB</span>';
+
+  item.innerHTML = `
+    <img src="${escapeHtml(avatar)}" alt="" class="chat-avatar" onerror="this.style.opacity='0.3'" />
+    <div class="chat-body">
+      <span class="chat-meta">
+        ${badgesHtml}
+        <span class="chat-author">${escapeHtml(msg.nickname || msg.user)}</span>
+      </span>
+      <span class="chat-text">${escapeHtml(msg.comment)}</span>
+    </div>
+  `;
+
+  chatMessages.appendChild(item);
+  if (chatAutoScroll.checked) chatMessages.scrollTop = chatMessages.scrollHeight;
+  if (chatMessages.children.length > 200) chatMessages.removeChild(chatMessages.children[0]);
+}
+
+function appendGiftNotice(gift) {
+  const item = document.createElement('div');
+  item.className = 'chat-event-gift';
+
+  const giftImg = gift.giftPictureUrl
+    ? `<img src="${escapeHtml(gift.giftPictureUrl)}" class="chat-gift-img" alt="" />`
+    : '';
+
+  item.innerHTML = `
+    ${giftImg}
+    <div class="chat-event-text">
+      <strong>${escapeHtml(gift.nickname || gift.user)}</strong> enviou
+      <strong>${escapeHtml(gift.giftName)}</strong> x${gift.repeatCount}!
+    </div>
+  `;
+
+  chatMessages.appendChild(item);
+  if (chatAutoScroll.checked) chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function addSystemNotice(text) {
+  const item = document.createElement('div');
+  item.style.cssText = 'padding:3px 6px;font-size:0.72rem;color:#7d809a;text-align:center;';
+  item.textContent = text;
+  chatMessages.appendChild(item);
+  if (chatAutoScroll.checked) chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function clearChat() {
+  chatMessages.innerHTML = '';
+}
+
+// ── Offline Card ───────────────────────────────────────────────────────────
 function showOfflineCard(username, title) {
   if (offlineTitle) offlineTitle.textContent = `@${username} está OFFLINE`;
-  if (offlineMessage) offlineMessage.textContent = title ? `Última live gravada: "${title}"` : 'Este perfil não está transmitindo ao vivo no momento.';
+  if (offlineMessage) offlineMessage.textContent = title
+    ? `Última live: "${title}"`
+    : 'Canal offline no momento.';
   if (offlineCard) offlineCard.classList.remove('hidden');
 }
 
@@ -550,7 +760,9 @@ function hideUnmuteOverlay() {
   if (btnUnmuteOverlay) btnUnmuteOverlay.classList.add('hidden');
 }
 
+// ── Quality / Engine ───────────────────────────────────────────────────────
 function onEngineChange() {
+  currentEngine = engineSelect.value;
   initPlayer();
 }
 
@@ -558,10 +770,16 @@ function onQualityChange() {
   const selected = qualitySelect.value;
   if (selected.startsWith('flv_')) {
     engineSelect.value = 'flv';
+    currentEngine = 'flv';
+    destroyPlayer();
+    playerInitializing = true;
     initFlvPlayer(selected.replace('flv_', ''));
   } else {
     engineSelect.value = 'hls';
-    initHlsPlayer();
+    currentEngine = 'hls';
+    destroyPlayer();
+    playerInitializing = true;
+    initHlsPlayer(false);
   }
 }
 
@@ -571,7 +789,6 @@ function populateQualitySelector(qualities) {
     qualitySelect.innerHTML = '<option value="auto">Auto</option>';
     return;
   }
-
   qualities.forEach(q => {
     const opt = document.createElement('option');
     opt.value = q.format === 'flv' ? `flv_${q.quality}` : 'auto';
@@ -580,182 +797,18 @@ function populateQualitySelector(qualities) {
   });
 }
 
-// ========================================================
-// Real-Time Live Chat via SSE
-// ========================================================
-function connectChat(username, roomId) {
-  disconnectChat();
-
-  chatStatus.textContent = 'Conectando ao chat...';
-  chatMessages.innerHTML = '';
-  addSystemNotice('🔄 Conectando ao chat ao vivo...');
-
-  const apiBase = getApiBaseUrl();
-  const roomParam = roomId ? `&roomId=${encodeURIComponent(roomId)}` : '';
-  chatEventSource = new EventSource(`${apiBase}/api/live/chat?user=${encodeURIComponent(username)}${roomParam}`);
-
-  chatEventSource.onopen = () => {
-    chatStatus.textContent = 'Ao vivo no chat';
-  };
-
-  chatEventSource.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      handleChatMessage(data);
-    } catch (e) {
-      console.error('Erro no chat:', e);
-    }
-  };
-
-  chatEventSource.onerror = () => {
-    chatStatus.textContent = 'Reconectando chat...';
-  };
-}
-
-function disconnectChat() {
-  if (chatEventSource) {
-    try { chatEventSource.close(); } catch {}
-    chatEventSource = null;
-  }
-  chatStatus.textContent = 'Desconectado';
-}
-
-function handleChatMessage(data) {
-  switch (data.type) {
-    case 'status':
-      chatStatus.textContent = data.message;
-      break;
-
-    case 'connected':
-      chatStatus.textContent = 'Ao vivo no chat';
-      addSystemNotice(data.message);
-      break;
-
-    case 'chat':
-      appendChatComment(data);
-      break;
-
-    case 'gift':
-      appendGiftNotice(data);
-      break;
-
-    case 'like':
-      likesTicker.textContent = `❤️ ${formatNumber(data.totalLikes || data.likeCount || 0)}`;
-      statLikes.textContent = `❤️ ${formatNumber(data.totalLikes || data.likeCount || 0)}`;
-      break;
-
-    case 'viewers':
-      viewerCountEl.textContent = formatNumber(data.viewerCount);
-      statViewers.textContent = `👁️ ${formatNumber(data.viewerCount)}`;
-      break;
-
-    case 'streamEnd':
-      addSystemNotice('⚠️ A transmissão ao vivo foi encerrada.');
-      badgeLive.className = 'live-pill offline';
-      liveStatusText.textContent = 'ENCERRADA';
-      break;
-
-    case 'chatError':
-      chatStatus.textContent = data.message;
-      addSystemNotice(`ℹ️ ${data.message}`);
-      break;
-  }
-}
-
-function appendChatComment(msg) {
-  if (!msg.comment && !msg.user) return;
-  const item = document.createElement('div');
-  item.className = 'chat-item';
-
-  const avatar = msg.avatar || 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1 1%22/>';
-  
-  let badgesHtml = '';
-  if (msg.isModerator) badgesHtml += '<span class="chat-badge mod">MOD</span>';
-  if (msg.isSubscriber) badgesHtml += '<span class="chat-badge sub">SUB</span>';
-
-  item.innerHTML = `
-    <img src="${escapeHtml(avatar)}" alt="" class="chat-avatar" onerror="this.style.opacity='0.3'" />
-    <div class="chat-body">
-      <span class="chat-meta">
-        ${badgesHtml}
-        <span class="chat-author">${escapeHtml(msg.nickname || msg.user)}</span>
-      </span>
-      <span class="chat-text">${escapeHtml(msg.comment)}</span>
-    </div>
-  `;
-
-  chatMessages.appendChild(item);
-
-  if (chatAutoScroll.checked) {
-    chatMessages.scrollTop = chatMessages.scrollHeight;
-  }
-
-  if (chatMessages.children.length > 200) {
-    chatMessages.removeChild(chatMessages.children[0]);
-  }
-}
-
-function appendGiftNotice(gift) {
-  const item = document.createElement('div');
-  item.className = 'chat-event-gift';
-
-  const giftImg = gift.giftPictureUrl ? `<img src="${escapeHtml(gift.giftPictureUrl)}" class="chat-gift-img" alt="" />` : '';
-
-  item.innerHTML = `
-    ${giftImg}
-    <div class="chat-event-text">
-      <strong>${escapeHtml(gift.nickname || gift.user)}</strong> enviou <strong>${escapeHtml(gift.giftName)}</strong> x${gift.repeatCount}!
-    </div>
-  `;
-
-  chatMessages.appendChild(item);
-  if (chatAutoScroll.checked) {
-    chatMessages.scrollTop = chatMessages.scrollHeight;
-  }
-}
-
-function addSystemNotice(text) {
-  const item = document.createElement('div');
-  item.style.padding = '3px 6px';
-  item.style.fontSize = '0.72rem';
-  item.style.color = '#7d809a';
-  item.style.textAlign = 'center';
-  item.textContent = text;
-  chatMessages.appendChild(item);
-  if (chatAutoScroll.checked) {
-    chatMessages.scrollTop = chatMessages.scrollHeight;
-  }
-}
-
-function clearChat() {
-  chatMessages.innerHTML = '';
-}
-
-// ========================================================
-// Mobile Modes & Gestures
-// ========================================================
+// ── Mobile UI ──────────────────────────────────────────────────────────────
 function toggleViewMode() {
   isAppMode = !isAppMode;
-  if (isAppMode) {
-    bodyEl.className = 'mobile-layout-app';
-    showToast('Modo TikTok App Ativado');
-  } else {
-    bodyEl.className = 'mobile-layout-split';
-    showToast('Modo Dividido Ativado');
-  }
+  bodyEl.className = isAppMode ? 'mobile-layout-app' : 'mobile-layout-split';
+  showToast(isAppMode ? 'Modo TikTok App' : 'Modo Dividido');
 }
 
 function toggleChatVisibility() {
   isChatHidden = !isChatHidden;
-  if (isChatHidden) {
-    bodyEl.classList.add('chat-hidden');
-    btnFloatChat.style.opacity = '0.5';
-    showToast('Chat ocultado');
-  } else {
-    bodyEl.classList.remove('chat-hidden');
-    btnFloatChat.style.opacity = '1';
-    showToast('Chat visível');
-  }
+  bodyEl.classList.toggle('chat-hidden', isChatHidden);
+  btnFloatChat.style.opacity = isChatHidden ? '0.5' : '1';
+  showToast(isChatHidden ? 'Chat ocultado' : 'Chat visível');
 }
 
 function toggleMute() {
@@ -770,72 +823,47 @@ function updateSoundButton() {
 
 function toggleVideoFit() {
   const currentFit = videoElement.style.objectFit || 'contain';
-  if (currentFit === 'contain') {
-    videoElement.style.objectFit = 'cover';
-    showToast('Preenchimento: Tela cheia');
-  } else {
-    videoElement.style.objectFit = 'contain';
-    showToast('Preenchimento: Ajustar à tela');
-  }
+  videoElement.style.objectFit = currentFit === 'contain' ? 'cover' : 'contain';
+  showToast(currentFit === 'contain' ? 'Tela cheia' : 'Ajustar à tela');
 }
 
 function setupDoubleTap(element) {
   let lastTap = 0;
   element.addEventListener('touchend', (e) => {
-    const currentTime = new Date().getTime();
-    const tapLength = currentTime - lastTap;
-    if (tapLength < 350 && tapLength > 0) {
+    const now = Date.now();
+    if (now - lastTap < 350 && now - lastTap > 0) {
       const touch = e.changedTouches[0];
-      if (touch) {
-        triggerFloatingHeart(touch.clientX, touch.clientY);
-      }
+      if (touch) triggerFloatingHeart(touch.clientX, touch.clientY);
       e.preventDefault();
     }
-    lastTap = currentTime;
+    lastTap = now;
   });
 }
 
 function triggerFloatingHeart(x, y) {
   const heart = document.createElement('div');
   heart.className = 'floating-heart';
-  const hearts = ['❤️', '💖', '🔥', '✨', '💜'];
-  heart.textContent = hearts[Math.floor(Math.random() * hearts.length)];
+  heart.textContent = ['❤️', '💖', '🔥', '✨', '💜'][Math.floor(Math.random() * 5)];
   heart.style.left = `${x - 14}px`;
   heart.style.top = `${y - 20}px`;
   heartsContainer.appendChild(heart);
-
-  setTimeout(() => {
-    heart.remove();
-  }, 1400);
+  setTimeout(() => heart.remove(), 1400);
 }
 
 function toggleAspectRatio() {
   isVerticalRatio = !isVerticalRatio;
-  if (isVerticalRatio) {
-    playerContainer.classList.remove('ratio-16-9');
-    playerContainer.classList.add('ratio-9-16');
-    showToast('Proporção: Vertical (9:16)');
-  } else {
-    playerContainer.classList.remove('ratio-9-16');
-    playerContainer.classList.add('ratio-16-9');
-    showToast('Proporção: Horizontal (16:9)');
-  }
+  playerContainer.classList.toggle('ratio-9-16', isVerticalRatio);
+  playerContainer.classList.toggle('ratio-16-9', !isVerticalRatio);
+  showToast(isVerticalRatio ? 'Proporção: Vertical (9:16)' : 'Proporção: Horizontal (16:9)');
 }
 
 function toggleTheaterMode() {
   isTheaterMode = !isTheaterMode;
-  if (isTheaterMode) {
-    playerContainer.classList.add('theater-mode');
-    showToast('Modo Cinema');
-  } else {
-    playerContainer.classList.remove('theater-mode');
-    showToast('Modo Padrão');
-  }
+  playerContainer.classList.toggle('theater-mode', isTheaterMode);
+  showToast(isTheaterMode ? 'Modo Cinema' : 'Modo Padrão');
 }
 
-// ========================================================
-// Settings (Free Backend Hosting Options)
-// ========================================================
+// ── Settings ───────────────────────────────────────────────────────────────
 function openSettings() {
   backendUrlInput.value = localStorage.getItem(BACKEND_STORAGE_KEY) || '';
   settingsModal.classList.remove('hidden');
@@ -852,7 +880,7 @@ function saveBackendUrl() {
     showToast('Servidor salvo: ' + val);
   } else {
     localStorage.removeItem(BACKEND_STORAGE_KEY);
-    showToast('Usando servidor padrão (mesmo domínio)');
+    showToast('Usando servidor padrão');
   }
   closeSettings();
 }
@@ -864,17 +892,14 @@ function resetBackendUrl() {
   closeSettings();
 }
 
-// ========================================================
-// Helpers & Storage
-// ========================================================
+// ── Helpers ────────────────────────────────────────────────────────────────
 async function openInVlc() {
-  if (!currentStreamData || !currentStreamData.streams) {
+  if (!currentStreamData?.streams) {
     showToast('Nenhuma live carregada.');
     return;
   }
   const streamUrl = currentStreamData.streams.bestFlv || currentStreamData.streams.hlsMaster;
-  const apiBase = getApiBaseUrl();
-
+  const apiBase = getApiBase();
   showToast('Tentando abrir no VLC...');
   try {
     const res = await fetch(`${apiBase}/api/open-player`, {
@@ -890,11 +915,13 @@ async function openInVlc() {
 }
 
 function copyStreamUrl(type) {
-  if (!currentStreamData || !currentStreamData.streams) {
+  if (!currentStreamData?.streams) {
     showToast('Nenhuma live carregada.');
     return;
   }
-  const url = type === 'm3u8' ? currentStreamData.streams.hlsMaster : currentStreamData.streams.bestFlv;
+  const url = type === 'm3u8'
+    ? currentStreamData.streams.hlsMaster
+    : currentStreamData.streams.bestFlv;
   if (!url) {
     showToast(`Nenhum link ${type.toUpperCase()} disponível.`);
     return;
@@ -906,11 +933,9 @@ function copyStreamUrl(type) {
   });
 }
 
-const CHANNELS_STORAGE_KEY = 'tiktok_live_viewer_saved_channels';
-
 function getSavedChannels() {
   try {
-    const raw = localStorage.getItem(CHANNELS_STORAGE_KEY);
+    const raw = localStorage.getItem(CHANNELS_KEY);
     return raw ? JSON.parse(raw) : ['loud_coringa', 'nobru', 'cerol'];
   } catch {
     return [];
@@ -918,9 +943,7 @@ function getSavedChannels() {
 }
 
 function setSavedChannels(channels) {
-  try {
-    localStorage.setItem(CHANNELS_STORAGE_KEY, JSON.stringify(channels));
-  } catch {}
+  try { localStorage.setItem(CHANNELS_KEY, JSON.stringify(channels)); } catch {}
 }
 
 function addRecentChannel(username) {
@@ -944,10 +967,7 @@ function renderSavedChannels() {
   channels.forEach(ch => {
     const chip = document.createElement('div');
     chip.className = 'quick-chip';
-    chip.innerHTML = `
-      <span>@${escapeHtml(ch)}</span>
-      <span class="chip-del">&times;</span>
-    `;
+    chip.innerHTML = `<span>@${escapeHtml(ch)}</span><span class="chip-del">&times;</span>`;
     chip.querySelector('span:first-child').addEventListener('click', () => {
       usernameInput.value = ch;
       loadStreamer(ch);
@@ -977,9 +997,7 @@ function showToast(message) {
   if (toastTimeout) clearTimeout(toastTimeout);
   toastEl.textContent = message;
   toastEl.classList.remove('hidden');
-  toastTimeout = setTimeout(() => {
-    toastEl.classList.add('hidden');
-  }, 3200);
+  toastTimeout = setTimeout(() => toastEl.classList.add('hidden'), 3200);
 }
 
 function formatNumber(num) {
