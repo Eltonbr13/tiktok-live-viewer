@@ -1,8 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { spawn } = require('child_process');
-const fs = require('fs');
+const https = require('https');
+const http = require('http');
 const { Readable } = require('stream');
 const { TikTokLiveConnection } = require('tiktok-live-connector');
 const { normalizeUsername, getLiveStreamData } = require('./stream-resolver');
@@ -14,18 +14,33 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-/**
- * Common request headers for proxying TikTok CDN requests
- */
-const TIKTOK_CDN_HEADERS = {
+const TIKTOK_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
   'Referer': 'https://www.tiktok.com/',
   'Origin': 'https://www.tiktok.com'
 };
 
 /**
+ * Raw http/https fetch helper (avoids fetch() quirks on some Node versions)
+ */
+function rawFetch(url, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.get(url, {
+      headers: { ...TIKTOK_HEADERS, ...extraHeaders },
+      timeout: 20000
+    }, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks), headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+/**
  * GET /api/live/info?user=<username>
- * Fetches stream info, qualities, title, avatar, room status without login.
  */
 app.get('/api/live/info', async (req, res) => {
   const rawUser = req.query.user;
@@ -35,51 +50,39 @@ app.get('/api/live/info', async (req, res) => {
 
   try {
     const data = await getLiveStreamData(rawUser);
-    return res.json({
-      success: true,
-      data: data
-    });
+    return res.json({ success: true, data });
   } catch (err) {
-    console.error(`Erro ao buscar dados de @${rawUser}:`, err.message);
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Erro ao consultar a live no TikTok.'
-    });
+    console.error(`[live/info] Erro @${rawUser}:`, err.message);
+    return res.status(500).json({ success: false, error: err.message || 'Erro ao consultar a live.' });
   }
 });
 
 /**
- * GET /api/proxy/m3u8?url=<encoded_url>
- * Proxies the HLS M3U8 playlist. Rewrites sub-playlists through the proxy,
- * but keeps .ts video chunks pointing DIRECTLY to TikTok's CDN.
- * Since TikTok CDN allows Access-Control-Allow-Origin: *, this completely
- * prevents Render server bottlenecking, freezing, and video stuttering.
+ * GET /api/proxy/m3u8?url=<encoded>
+ * Rewrites sub-playlist URLs through the proxy; TS segments point directly to CDN.
  */
 app.get('/api/proxy/m3u8', async (req, res) => {
   const targetUrl = req.query.url;
   const proxySegments = req.query.proxySegments === '1';
-  if (!targetUrl) {
-    return res.status(400).send('URL missing');
-  }
+  if (!targetUrl) return res.status(400).send('URL missing');
 
   try {
-    const cdnRes = await fetch(targetUrl, {
-      cache: 'no-store',
-      headers: TIKTOK_CDN_HEADERS
-    });
+    const fetched = await rawFetch(targetUrl);
 
-    if (!cdnRes.ok) {
-      return res.status(cdnRes.status).send(`CDN retornou código ${cdnRes.status}`);
+    if (fetched.status !== 200) {
+      return res.status(fetched.status).send(`CDN retornou ${fetched.status}`);
     }
 
-    const text = await cdnRes.text();
+    const text = fetched.body.toString('utf8');
     const baseUrl = new URL(targetUrl);
-    const lines = text.split(/\r?\n/);
 
     const resolveWithAuth = (rawUri) => {
       try {
+        if (rawUri.startsWith('http://') || rawUri.startsWith('https://')) {
+          return rawUri;
+        }
+        // Relative path: resolve against base, copy query params if missing
         const resolved = new URL(rawUri, baseUrl);
-        // Preserve TikTok CDN auth query params (?expire=...&sign=...) when relative path lacks them
         if (!resolved.search && baseUrl.search) {
           resolved.search = baseUrl.search;
         }
@@ -89,11 +92,12 @@ app.get('/api/proxy/m3u8', async (req, res) => {
       }
     };
 
+    const lines = text.split(/\r?\n/);
     const rewritten = lines.map(line => {
       const trimmed = line.trim();
       if (!trimmed) return line;
 
-      // Rewrite URI="..." inside tags like #EXT-X-MAP or #EXT-X-KEY
+      // Handle tags with URI="..."
       if (trimmed.startsWith('#')) {
         if (trimmed.includes('URI="')) {
           return line.replace(/URI="([^"]+)"/g, (_, uri) => {
@@ -107,16 +111,15 @@ app.get('/api/proxy/m3u8', async (req, res) => {
         return line;
       }
 
-      const absoluteUrl = resolveWithAuth(trimmed);
+      const absUrl = resolveWithAuth(trimmed);
 
-      if (absoluteUrl.includes('.m3u8')) {
+      if (absUrl.includes('.m3u8')) {
         const ps = proxySegments ? '&proxySegments=1' : '';
-        return `/api/proxy/m3u8?url=${encodeURIComponent(absoluteUrl)}${ps}`;
+        return `/api/proxy/m3u8?url=${encodeURIComponent(absUrl)}${ps}`;
       } else if (proxySegments) {
-        return `/api/proxy/stream?url=${encodeURIComponent(absoluteUrl)}`;
+        return `/api/proxy/stream?url=${encodeURIComponent(absUrl)}`;
       } else {
-        // Direct to CDN for video segments (with preserved auth query params): zero Render CPU load!
-        return absoluteUrl;
+        return absUrl;
       }
     });
 
@@ -125,73 +128,64 @@ app.get('/api/proxy/m3u8', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     return res.send(rewritten.join('\n'));
   } catch (err) {
-    console.error('Erro no proxy M3U8:', err.message);
-    return res.status(500).send('Erro no proxy M3U8: ' + err.message);
+    console.error('[proxy/m3u8] Erro:', err.message);
+    return res.status(500).send('Erro proxy M3U8: ' + err.message);
   }
 });
 
 /**
- * GET /api/proxy/stream?url=<encoded_url>
- * Fallback stream proxy for platforms/browsers that require proxied chunks.
+ * GET /api/proxy/stream?url=<encoded>
+ * Pipes CDN stream bytes to the browser (for FLV/TS that need CORS proxy).
  */
-app.get('/api/proxy/stream', async (req, res) => {
+app.get('/api/proxy/stream', (req, res) => {
   const targetUrl = req.query.url;
-  if (!targetUrl) {
-    return res.status(400).send('URL missing');
-  }
+  if (!targetUrl) return res.status(400).send('URL missing');
 
-  try {
-    const headers = { ...TIKTOK_CDN_HEADERS };
-    if (req.headers.range) {
-      headers['Range'] = req.headers.range;
-    }
+  const lib = targetUrl.startsWith('https') ? https : http;
+  const headers = { ...TIKTOK_HEADERS };
+  if (req.headers.range) headers['Range'] = req.headers.range;
 
-    const cdnRes = await fetch(targetUrl, {
-      headers: headers
-    });
-
-    res.status(cdnRes.status);
+  const proxyReq = lib.get(targetUrl, { headers, timeout: 30000 }, (cdnRes) => {
+    res.status(cdnRes.statusCode);
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.setHeader('Connection', 'keep-alive');
 
-    const contentType = cdnRes.headers.get('content-type');
-    if (contentType) {
-      res.setHeader('Content-Type', contentType);
+    const ct = cdnRes.headers['content-type'];
+    if (ct) {
+      res.setHeader('Content-Type', ct);
     } else if (targetUrl.includes('.flv')) {
       res.setHeader('Content-Type', 'video/x-flv');
     } else if (targetUrl.includes('.ts')) {
       res.setHeader('Content-Type', 'video/MP2T');
     }
 
-    const contentLength = cdnRes.headers.get('content-length');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-
-    const contentRange = cdnRes.headers.get('content-range');
-    if (contentRange) res.setHeader('Content-Range', contentRange);
-
+    if (cdnRes.headers['content-length']) {
+      res.setHeader('Content-Length', cdnRes.headers['content-length']);
+    }
+    if (cdnRes.headers['content-range']) {
+      res.setHeader('Content-Range', cdnRes.headers['content-range']);
+    }
     if (res.flushHeaders) res.flushHeaders();
 
-    if (cdnRes.body) {
-      const stream = Readable.fromWeb(cdnRes.body);
-      stream.pipe(res);
-      req.on('close', () => {
-        stream.destroy();
-      });
-    } else {
-      res.end();
-    }
-  } catch (err) {
-    console.error('Erro no proxy de stream:', err.message);
-    if (!res.headersSent) {
-      res.status(500).send('Erro no proxy de stream: ' + err.message);
-    }
-  }
+    cdnRes.pipe(res);
+    req.on('close', () => cdnRes.destroy());
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error('[proxy/stream] Erro:', err.message);
+    if (!res.headersSent) res.status(502).send('Proxy error: ' + err.message);
+  });
+
+  proxyReq.on('timeout', () => {
+    proxyReq.destroy();
+    if (!res.headersSent) res.status(504).send('Proxy timeout');
+  });
 });
 
 /**
  * GET /api/live/chat?user=<username>&roomId=<roomId>
- * Server-Sent Events (SSE) stream for real-time live chat messages, likes, and gifts.
+ * SSE stream for real-time chat, gifts, likes, viewers.
  */
 app.get('/api/live/chat', async (req, res) => {
   const username = normalizeUsername(req.query.user);
@@ -201,83 +195,106 @@ app.get('/api/live/chat', async (req, res) => {
     return res.status(400).json({ error: 'Username inválido.' });
   }
 
-  // Setup SSE headers with anti-buffering for Render and proxies
+  // SSE setup - disable all buffering
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no',
-    'Content-Encoding': 'none',
+    'Content-Encoding': 'identity',
+    'Transfer-Encoding': 'identity',
     'Access-Control-Allow-Origin': '*'
   });
 
+  if (res.socket) {
+    res.socket.setNoDelay(true);
+    res.socket.setTimeout(0);
+    res.socket.setKeepAlive(true, 10000);
+  }
+
+  // Force flush headers immediately
   if (res.flushHeaders) res.flushHeaders();
+  // Write a comment to trigger immediate flush
+  res.write(': connected\n\n');
 
   const sendEvent = (eventData) => {
     try {
+      if (res.writableEnded) return;
       res.write(`data: ${JSON.stringify(eventData)}\n\n`);
       if (res.flush) res.flush();
     } catch (e) {
-      // ignore
+      // connection closed
     }
   };
 
-  // Heartbeat ping every 15s to keep SSE connection alive on Render
+  // Heartbeat every 20s
   const pingInterval = setInterval(() => {
     try {
+      if (res.writableEnded) {
+        clearInterval(pingInterval);
+        return;
+      }
       res.write(': ping\n\n');
       if (res.flush) res.flush();
     } catch {
       clearInterval(pingInterval);
     }
-  }, 15000);
+  }, 20000);
 
-  sendEvent({ type: 'status', message: `Conectando ao chat da live de @${username}...` });
+  sendEvent({ type: 'status', message: `Conectando ao chat de @${username}...` });
 
   let conn = null;
+  let connected = false;
+
+  const cleanup = () => {
+    clearInterval(pingInterval);
+    if (conn) {
+      try { conn.disconnect(); } catch {}
+      conn = null;
+    }
+  };
+
+  req.on('close', cleanup);
+  req.on('error', cleanup);
+
   try {
     conn = new TikTokLiveConnection(username, {
       fetchRoomInfoOnConnect: false,
-      enableExtendedGiftInfo: false
+      enableExtendedGiftInfo: false,
+      requestPollingIntervalMs: 2000,
+      sessionId: undefined
     });
 
     conn.on('connected', (state) => {
+      connected = true;
+      console.log(`[chat] ✅ Conectado ao chat de @${username}, roomId=${state?.roomId}`);
       sendEvent({
         type: 'connected',
-        message: `Conectado ao chat ao vivo de @${username}!`,
+        message: `✅ Chat ao vivo de @${username} conectado!`,
         roomId: state?.roomId || roomId || ''
       });
     });
 
     conn.on('chat', (data) => {
-      // Robust mapping supporting v1, v2 and v3 protobuf formats
       const user = data.user || {};
       const uniqueId = user.uniqueId || data.uniqueId || user.displayId || 'Anônimo';
       const nickname = user.nickname || data.nickname || uniqueId;
-      const comment = data.content || data.comment || '';
-
+      const comment = data.content || data.comment || data.text || '';
       if (!comment) return;
 
       let avatar = '';
-      if (user.profilePicture?.urls?.[0]) {
-        avatar = user.profilePicture.urls[0];
-      } else if (user.avatarThumb?.urls?.[0]) {
-        avatar = user.avatarThumb.urls[0];
-      } else if (data.profilePictureUrl) {
-        avatar = data.profilePictureUrl;
-      }
-
-      const msgId = data.common?.msgId || data.msgId || (Date.now() + Math.random().toString());
+      if (user.profilePicture?.urls?.[0]) avatar = user.profilePicture.urls[0];
+      else if (user.avatarThumb?.urls?.[0]) avatar = user.avatarThumb.urls[0];
+      else if (data.profilePictureUrl) avatar = data.profilePictureUrl;
 
       sendEvent({
         type: 'chat',
-        id: msgId,
         user: uniqueId,
-        nickname: nickname,
-        comment: comment,
-        avatar: avatar,
-        isModerator: !!(data.isModerator || user.userBadges?.some(b => b.badgeType === 1)),
-        isSubscriber: !!(data.isSubscriber || user.userBadges?.some(b => b.badgeType === 2)),
+        nickname,
+        comment,
+        avatar,
+        isModerator: !!(data.isModerator || user.isModerator),
+        isSubscriber: !!(data.isSubscriber || user.isSubscriber),
         timestamp: Date.now()
       });
     });
@@ -288,141 +305,80 @@ app.get('/api/live/chat', async (req, res) => {
       const nickname = user.nickname || data.nickname || uniqueId;
       const giftName = data.giftDetails?.giftName || data.giftName || data.gift?.name || 'Presente';
       const repeatCount = data.repeatCount || data.groupCount || 1;
-      const diamondCount = data.diamondCount || data.fanTicketCount || 0;
 
       let giftImg = data.giftPictureUrl || '';
-      if (data.giftImage?.urls?.[0]) {
-        giftImg = data.giftImage.urls[0];
-      } else if (data.gift?.image?.urlList?.[0]) {
-        giftImg = data.gift.image.urlList[0];
-      }
+      if (data.giftImage?.urls?.[0]) giftImg = data.giftImage.urls[0];
+      else if (data.gift?.image?.urlList?.[0]) giftImg = data.gift.image.urlList[0];
 
       sendEvent({
         type: 'gift',
         user: uniqueId,
-        nickname: nickname,
-        giftName: giftName,
-        repeatCount: repeatCount,
-        diamondCount: diamondCount,
+        nickname,
+        giftName,
+        repeatCount,
+        diamondCount: data.diamondCount || 0,
         giftPictureUrl: giftImg,
         timestamp: Date.now()
       });
     });
 
     conn.on('like', (data) => {
-      const likeCount = data.count || data.likeCount || 1;
-      const totalLikes = data.total ? parseInt(data.total, 10) : (data.totalLikes || 0);
-      sendEvent({
-        type: 'like',
-        likeCount: likeCount,
-        totalLikes: totalLikes
-      });
+      const totalLikes = data.total ? parseInt(data.total, 10) : (data.totalLikes || data.likeCount || 0);
+      sendEvent({ type: 'like', likeCount: data.count || 1, totalLikes });
     });
 
     conn.on('roomUser', (data) => {
       const viewerCount = data.total ? parseInt(data.total, 10) : (data.viewerCount || 0);
-      sendEvent({
-        type: 'viewers',
-        viewerCount: viewerCount
-      });
+      sendEvent({ type: 'viewers', viewerCount });
     });
 
     conn.on('streamEnd', () => {
-      sendEvent({
-        type: 'streamEnd',
-        message: 'A transmissão foi encerrada pelo criador.'
-      });
+      sendEvent({ type: 'streamEnd', message: 'A live foi encerrada.' });
     });
 
     conn.on('disconnected', () => {
-      sendEvent({
-        type: 'disconnected',
-        message: 'Chat desconectado.'
-      });
+      if (!res.writableEnded) {
+        sendEvent({ type: 'chatError', message: 'Chat desconectado.' });
+      }
     });
 
     conn.on('error', (err) => {
-      const errMsg = err?.info || err?.exception?.message || err?.message || 'Aviso no chat.';
-      sendEvent({
-        type: 'chatError',
-        message: errMsg
-      });
+      const msg = err?.info || err?.message || 'Erro no chat';
+      console.warn(`[chat] ⚠️ Erro @${username}:`, msg);
+      sendEvent({ type: 'chatError', message: msg });
     });
 
-    // Connect using roomId if provided (avoids duplicate fetchRoomId call)
+    console.log(`[chat] Conectando ao chat de @${username}, roomId=${roomId || 'auto'}...`);
     await conn.connect(roomId ? String(roomId) : undefined);
+
   } catch (err) {
-    console.error(`Erro ao conectar chat de @${username}:`, err.message);
+    console.error(`[chat] ❌ Falha ao conectar @${username}:`, err.message);
     sendEvent({
       type: 'chatError',
-      message: `Não foi possível carregar o chat da live: ${err.message}`
+      message: `Chat indisponível: ${err.message}. Assistindo sem chat.`
     });
   }
-
-  // Handle client disconnect
-  req.on('close', () => {
-    clearInterval(pingInterval);
-    if (conn) {
-      try {
-        conn.disconnect();
-      } catch {
-        // ignore
-      }
-    }
-  });
 });
 
 /**
- * POST /api/open-player
- * Attempts to launch local VLC or MPV with the stream URL
+ * GET /api/debug?user=<username>
+ * Returns raw stream data for debugging
  */
-app.post('/api/open-player', (req, res) => {
-  const { streamUrl } = req.body;
-  if (!streamUrl) {
-    return res.status(400).json({ success: false, error: 'URL do stream não informada.' });
+app.get('/api/debug', async (req, res) => {
+  const rawUser = req.query.user;
+  if (!rawUser) return res.status(400).json({ error: 'user param required' });
+
+  try {
+    const data = await getLiveStreamData(rawUser);
+    return res.json({ success: true, data });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
   }
-
-  const vlcCandidates = [
-    'vlc',
-    'C:\\Program Files\\VideoLAN\\VLC\\vlc.exe',
-    'C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe'
-  ];
-
-  let vlcPath = null;
-  for (const cand of vlcCandidates) {
-    if (cand === 'vlc') continue;
-    if (fs.existsSync(cand)) {
-      vlcPath = cand;
-      break;
-    }
-  }
-
-  if (vlcPath) {
-    try {
-      const child = spawn(vlcPath, [
-        streamUrl,
-        '--http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        '--http-referrer=https://www.tiktok.com/'
-      ], {
-        detached: true,
-        stdio: 'ignore'
-      });
-      child.unref();
-      return res.json({ success: true, message: 'VLC iniciado com sucesso!' });
-    } catch (e) {
-      return res.json({ success: false, error: 'Erro ao abrir VLC: ' + e.message });
-    }
-  }
-
-  return res.json({
-    success: false,
-    error: 'VLC não foi encontrado nas pastas padrão. Você pode copiar o link da live e abrir manualmente no VLC (Mídia > Abrir Transmissão de Rede).'
-  });
 });
 
 app.listen(PORT, () => {
-  console.log(`=====================================================`);
-  console.log(`  TikTok Live Stream Viewer - 100% Sem Login`);
-  console.log(`  Servidor rodando em: http://localhost:${PORT}`);
-  console.log(`=====================================================`);
+  console.log(`\n=====================================================`);
+  console.log(`  TikTok Live Stream Viewer - Sem Login`);
+  console.log(`  Servidor: http://localhost:${PORT}`);
+  console.log(`=====================================================\n`);
 });
